@@ -28,6 +28,8 @@
 - `/clear` 実行時にアーカイブ作成を自動化すること → 技術的制約（SessionEndフックの1.5秒タイムアウト、/clear自体がUserPromptSubmitフックを経由するか不確定）により見送り。archiveの更新は常にユーザーの明示的な指示があったときのみ手動で行う。
 
 ## 次にやること（未決事項）
-- プロジェクト種別（Python / Webアプリ）の確定
+- プロジェクト種別（Python / Webアプリ）の確定。候補出しを行い、詳細は `work_logs/archive/2026-10-08_03_project-idea-candidates.md` 参照。
+  - ユーザーは「ゲームがよさそう」と反応。最有力候補は **AIゲームマスター付きテキストアドベンチャー/TRPGアプリ**（Python GUI、agent=NPC応答・ストーリー生成、skill=シナリオテンプレート、hook=セーブ処理）。
+  - まだ確定ではなく検討中。
 - 種別確定後、CLAUDE.md の「言語・基本方針」セクションを具体化する
 - 必要になったタイミングで `.claude/skills/`・`.claude/agents/`・`.claude/hooks/` に実際のスキル・エージェント・Hookを追加する
