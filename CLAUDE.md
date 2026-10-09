@@ -29,6 +29,8 @@
 
 ## 依存関係・環境
 - Python: 仮想環境（venv）を使用し、依存関係は `requirements.txt`（または `pyproject.toml`）で管理する。
+  - venvはプロジェクトルートの `.venv/` に作成する（`.gitignore`で除外済み）。Pythonスクリプトの実行・パッケージの追加インストールは `.venv/Scripts/python.exe`（Windows）経由で行う。
+  - 新しい依存を追加したら `requirements.txt` に追記し、`.venv/Scripts/python.exe -m pip install -r requirements.txt` でvenvに反映する。
 - Webアプリ: package.json 等の依存関係ファイルをコミットし、ロックファイル（package-lock.json 等）も管理対象とする。
 - 新しい依存関係を追加する際は、理由をコミットメッセージまたはPRで簡潔に説明する。
 
