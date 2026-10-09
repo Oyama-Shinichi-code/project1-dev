@@ -15,6 +15,7 @@
 ## カスタムSkills・サブエージェント・Hooks
 - `.claude/skills/`: プロジェクト専用のカスタムスキルを置く。ひな型は `.claude/skills/_template/SKILL.md`。新規作成時はこのフォルダをコピーし、`name`/`description`（frontmatter）を実際の内容に合わせて書き換える。
 - `.claude/agents/`: プロジェクト専用のサブエージェント定義を置く。ひな型は `.claude/agents/_template.md`。新規作成時はこのファイルをコピーし、`name`/`description`/`tools`（frontmatter）と本文を実際の役割に合わせて書き換える。
+  - 汎用サブエージェント作成済み: `code-reviewer`, `test-writer`, `debugger`, `security-reviewer`, `doc-writer`, `changelog-writer`。プロジェクト固有のエージェントは種別確定後に追加する。
 - `.claude/hooks/`: プロジェクト専用のHookスクリプトを置く。ひな型は `.claude/hooks/_template.sh`。新規作成時はこのファイルをコピーし、処理内容を書き換えた上で `.claude/settings.json`（`.claude/settings.json.example` を参考に作成）の `hooks` セクションに登録する。
 - `_template` で始まるファイル/フォルダはひな型であり、スキル・エージェント・Hookとして直接は使用しない。
 
