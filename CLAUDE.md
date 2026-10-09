@@ -46,6 +46,7 @@
   - `dev`: https://github.com/Oyama-Shinichi-code/project1-dev.git （検証用リポジトリ、Public）
 - `main` ブランチのデフォルト upstream は `dev` に設定済み。引数なしの `git push` / `git pull` は検証用リポジトリ (`dev`) に対して行われる。
 - **本番リポジトリ (`origin`) へは、ユーザーから明示的に指示があった場合のみ `git push origin main` のように明示指定して反映すること。** 誤って本番に反映してしまうミスを避けるのが目的なので、基本の作業・動作確認は `dev` 側で行う。
+- push操作はカスタムSkillで行う: `/push-dev`（devのみに反映）、`/push-all`（devとorigin両方に反映。本番への明示的な指示とみなす）。詳細は `.claude/skills/push-dev/SKILL.md`、`.claude/skills/push-all/SKILL.md` 参照。
 - コミットは意味のある単位に分割する。
 - コミットメッセージは「なぜ」を中心に簡潔に記載する。
 - push・pull 等のリモート操作を行う前は `git status` で作業ツリーの状態を確認する。
