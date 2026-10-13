@@ -1,102 +1,129 @@
-"""
-OpenAI の画像生成API (gpt-image-1) を使った汎用画像生成モジュール。
+"""Pollinations.ai を使った画像生成ツール。
 
-どのプロジェクトからも
-`from tools.image_gen.generate_image import generate_image` でインポートして使える独立モジュール。
-
-CLIとしても実行可能:
-    python generate_image.py "プロンプト文" -o output.png --size 1024x1024
+認証不要・APIキー不要で画像生成APIを呼び出せる(2026年時点で確認済み)。
+以前のHugging Face版(課金必須と判明)から移行した。
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
-import os
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
-from openai import OpenAI
+# Windows環境でのコンソール出力の文字化け対策
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
-# Windows環境でのcp932/UTF-8不一致によるコンソール出力の文字化けを避ける
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
-        _stream.reconfigure(encoding="utf-8")
-
-# gpt-image-1 がサポートするサイズ値（公式ドキュメント確認済み: 正方形 or 縦長/横長の3種 + auto）。
-SUPPORTED_SIZES = ("1024x1024", "1024x1536", "1536x1024", "auto")
-DEFAULT_SIZE = "1024x1024"
-
-# プロジェクトルートの .env を読み込む（このファイルから2階層上がルート: tools/image_gen/ -> project1/）。
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(dotenv_path=_PROJECT_ROOT / ".env")
+BASE_URL = "https://image.pollinations.ai/prompt/{}"
+# プロジェクトルート基準のデフォルト保存先 (tools/image_gen/generate_image.py から2階層上)
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / "tools" / "generated_images"
+TIMEOUT_SECONDS = 60
 
 
-def generate_image(prompt: str, output_path: str | Path, size: str = DEFAULT_SIZE) -> Path:
-    """gpt-image-1 で画像を生成し、output_path にPNG等として保存してPathを返す。
+class ImageGenerationError(RuntimeError):
+    """画像生成リクエストが失敗したことを示す例外。"""
+
+
+def _build_default_output_path(prompt: str) -> Path:
+    """プロンプトとタイムスタンプから分かりやすいファイル名を自動生成する。"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # ファイル名に使えない文字を除去し、長すぎる場合は切り詰める
+    safe_prompt = "".join(c if c.isalnum() or c in (" ", "_", "-") else "" for c in prompt)
+    safe_prompt = safe_prompt.strip().replace(" ", "_")[:40] or "image"
+    DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return DEFAULT_OUTPUT_DIR / f"{timestamp}_{safe_prompt}.png"
+
+
+def generate_image(
+    prompt: str,
+    output_path: str | Path | None = None,
+    width: int = 1024,
+    height: int = 1024,
+    model: str = "flux",
+    seed: int | None = None,
+) -> Path:
+    """Pollinations.ai APIで画像を生成し、ファイルに保存する。
 
     Args:
-        prompt: 画像生成のプロンプト文。
-        output_path: 保存先ファイルパス。
-        size: "1024x1024" / "1024x1536" / "1536x1024" / "auto" のいずれか。
+        prompt: 画像生成用のテキストプロンプト。
+        output_path: 保存先パス。省略時は tools/generated_images/ 配下に自動命名で保存。
+        width: 画像の幅(px)。
+        height: 画像の高さ(px)。
+        model: 使用モデル("flux", "turbo", "stable-diffusion"等)。
+        seed: 再現性のためのシード値。省略時は毎回ランダムな画像になる。
 
     Returns:
         保存した画像ファイルのPath。
 
     Raises:
-        ValueError: size が未サポートの値、または OPENAI_API_KEY が未設定の場合。
+        ImageGenerationError: タイムアウトやHTTPエラー等でリクエストが失敗した場合。
     """
-    if size not in SUPPORTED_SIZES:
-        raise ValueError(
-            f"未サポートのsizeです: {size!r} (サポート値: {', '.join(SUPPORTED_SIZES)})"
-        )
+    encoded_prompt = urllib.parse.quote(prompt)
+    params = {"width": str(width), "height": str(height), "model": model, "nologo": "true"}
+    if seed is not None:
+        params["seed"] = str(seed)
+    url = BASE_URL.format(encoded_prompt) + "?" + urllib.parse.urlencode(params)
 
-    # APIキーが無い状態でクライアントを作ると分かりにくいエラーになるため、先に明示チェックする。
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise ValueError(
-            "OPENAI_API_KEY が設定されていません。"
-            "プロジェクトルートの .env に OPENAI_API_KEY=sk-... の形式で設定してください"
-            "（.env.example を参考にしてください）。"
-        )
+    if output_path is None:
+        resolved_output_path = _build_default_output_path(prompt)
+    else:
+        resolved_output_path = Path(output_path)
+        resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    client = OpenAI()
+    try:
+        with urllib.request.urlopen(url, timeout=TIMEOUT_SECONDS) as response:
+            if response.status != 200:
+                raise ImageGenerationError(
+                    f"画像生成に失敗しました(HTTPステータス: {response.status})"
+                )
+            image_data = response.read()
+    except urllib.error.HTTPError as e:
+        raise ImageGenerationError(
+            f"画像生成APIがエラーを返しました(HTTPステータス: {e.code})"
+        ) from e
+    except urllib.error.URLError as e:
+        # タイムアウトやDNS解決失敗等、ネットワーク関連のエラーをまとめて扱う
+        raise ImageGenerationError(f"画像生成APIへの接続に失敗しました: {e.reason}") from e
 
-    # gpt-image-1 は response_format パラメータを受け付けず、常に b64_json 形式でのみ画像データを返す
-    # （dall-e-2/3 はresponse_format="url"等が選べたが、gpt-image-1では廃止されている）。
-    response = client.images.generate(
-        model="gpt-image-1",
-        prompt=prompt,
-        size=size,
-        n=1,
-    )
-
-    b64_data = response.data[0].b64_json
-    image_bytes = base64.b64decode(b64_data)
-
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(image_bytes)
-
-    return output_path
+    resolved_output_path.write_bytes(image_data)
+    return resolved_output_path
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="OpenAI gpt-image-1 を使った画像生成CLI")
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Pollinations.aiで画像を生成する")
     parser.add_argument("prompt", help="画像生成用のプロンプト文")
+    parser.add_argument("-o", "--output", help="出力先ファイルパス(省略時は自動命名)")
+    parser.add_argument("--width", type=int, default=1024, help="画像の幅(px)")
+    parser.add_argument("--height", type=int, default=1024, help="画像の高さ(px)")
     parser.add_argument(
-        "-o", "--output", default="output.png", help="出力先ファイルパス（デフォルト: output.png）"
+        "--model", default="flux", help="使用モデル(flux, turbo, stable-diffusion等)"
     )
-    parser.add_argument(
-        "--size",
-        default=DEFAULT_SIZE,
-        choices=SUPPORTED_SIZES,
-        help=f"画像サイズ（デフォルト: {DEFAULT_SIZE}）",
-    )
-    return parser
+    parser.add_argument("--seed", type=int, default=None, help="再現性のためのシード値")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    try:
+        saved_path = generate_image(
+            prompt=args.prompt,
+            output_path=args.output,
+            width=args.width,
+            height=args.height,
+            model=args.model,
+            seed=args.seed,
+        )
+    except ImageGenerationError as e:
+        print(f"エラー: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"画像を保存しました: {saved_path}")
 
 
 if __name__ == "__main__":
-    args = _build_arg_parser().parse_args()
-    saved_path = generate_image(args.prompt, args.output, size=args.size)
-    print(f"画像を保存しました: {saved_path}")
+    main()

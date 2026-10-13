@@ -6,3 +6,7 @@ venv/
 .env.*
 !.env.example
 node_modules/
+
+# 生成画像(バイナリ)はリポジトリに含めない。フォルダ構成だけ.gitkeepで保持する
+tools/generated_images/*
+!tools/generated_images/.gitkeep
