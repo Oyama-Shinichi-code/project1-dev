@@ -10,3 +10,7 @@ node_modules/
 # 生成画像(バイナリ)はリポジトリに含めない。フォルダ構成だけ.gitkeepで保持する
 tools/generated_images/*
 !tools/generated_images/.gitkeep
+
+# デスクトップペットのセーブデータ（プレイヤーごとの状態）はリポジトリに含めない
+desktop_pet/data/*
+!desktop_pet/data/.gitkeep
