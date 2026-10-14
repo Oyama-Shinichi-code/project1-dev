@@ -76,12 +76,14 @@ class PetState:
         # last_updated は更新しない（過去のステータス変化・イベント履行を取り消さない）。
 
     # --- 基本アクション ---
+    # feed/pet はステータスの加算のみ行い、apply_time_decay()は呼ばない。
+    # 時間経過による自然減少は定期タイマー側（main.pyのrefresh）だけの責務とし、
+    # アクション実行のたびにそれまでの経過分がまとめて反映されて数値が動いて見える
+    # （「なでた/餌をあげたのに満腹度が減った」ように見える）事態を避けるため。
     def feed(self, amount: float = 25.0) -> None:
-        self.apply_time_decay()
         self.hunger = _clamp(self.hunger + amount)
 
     def pet(self, amount: float = 15.0) -> None:
-        self.apply_time_decay()
         self.mood = _clamp(self.mood + amount)
 
     # --- 見た目切り替え用の表情判定 ---

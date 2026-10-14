@@ -44,8 +44,9 @@ class PetController:
         overfed = self.state.hunger >= 100
         if overfed:
             # あげすぎ時は満腹度を加算しない代わりに、機嫌を少し下げるペナルティを与える
-            # （「無理に食べさせられて嫌がる」ことの表現。hunger自体は変化させない）
-            self.state.apply_time_decay()
+            # （「無理に食べさせられて嫌がる」ことの表現。hunger自体は変化させない）。
+            # apply_time_decay()はここでは呼ばない。満腹度の減少は時間経過（定期タイマー側の
+            # apply_time_decay呼び出し）のみに委ね、アクション起点では発生させないため。
             self.state.mood = max(0.0, self.state.mood - 5.0)
         else:
             self.state.feed()

@@ -2,12 +2,11 @@
 
 > このファイルは常に最新状態で上書きする。`/clear` 直後や新しいセッション開始時は、まずこのファイルを読めば現状復帰できる。
 > 更新タイミング: ユーザーから明示的に指示があったときのみ（毎プロンプトでは更新しない）。
-> 最終更新: 2026-10-13
+> 最終更新: 2026-10-14
 
 ## プロジェクトの現状
-- プロジェクト種別は Python か Webアプリかまだ未確定。`requirements_drafts/` に4候補の要件定義ドラフトを作成済み（詳細は後述）。
-- 画像生成ツール（`tools/image_gen/`）は実装済み・コミット済み。Pollinations.ai（認証不要・無料）を使用。
-- それ以外の実コードはまだ存在しない。
+- プロジェクト種別は**デスクトップペット育成シミュレーション**に確定（実質）。`desktop_pet/`で開発中。要件定義は`requirements_drafts/desktop_pet_simulation.md`。
+- MVP一式（常駐ウィンドウ、ステータス管理、餌やり/なでるモーション、時間操作、永続化）に加え、アニメーション・各種演出も実装済み。
 
 ## Git構成
 - `origin`: https://github.com/Oyama-Shinichi-code/project1.git （本番リポジトリ）
@@ -15,35 +14,49 @@
 - `main` ブランチのデフォルト upstream は `dev`。引数なしの `git push`/`git pull` は検証用リポジトリに向く。
 - 本番(`origin`)へは、ユーザーからの明示的な指示があったときのみ反映する。
 - push操作は `/push-dev`（devのみ）、`/push-all`（dev+origin）のカスタムSkillで行う。
-- 直近コミット: `991dac8`（画像生成をPollinations.aiに移行）。未コミットの変更なし。
 
-## 画像生成ツール（tools/image_gen/）
-- **使用API**: Pollinations.ai（`https://image.pollinations.ai/prompt/{prompt}`）。認証・APIキー・サインアップ一切不要、完全無料。
-- **これまでの試行**: OpenAI(`gpt-image-1`、有料のため削除) → Hugging Face FLUX.1-schnell(トークン取得後402 Payment Required、クレジット必須のため削除) → Pollinations.ai(動作確認済み、採用)。
-- **教訓**: 画像生成APIは実装前に実際にAPIを叩いて無料で使えることを確認すること（過去2回、調査段階の情報だけで実装し手戻りが発生した）。
-- **制約**: 匿名利用は15秒に1回のレート制限、ウォーターマークが入る可能性あり（`nologo=true`で軽減）。
-- **画像の保存先**: 今後生成する画像は `tools/generated_images/` に保存する方針（`.gitignore`で画像バイナリ自体は除外、`.gitkeep`でフォルダ構成のみ保持）。
-- `tools/image_gen/README.md`は無し（ユーザーの判断により削除。認証不要になり他者への説明が不要と判断）。
-- 使い方: `from tools.image_gen.generate_image import generate_image` または `.venv/Scripts/python.exe tools/image_gen/generate_image.py "プロンプト" [--width] [--height] [--model] [--seed] [-o 出力先]`。
+## デスクトップペットアプリ（desktop_pet/）
+- 起動: `.venv/Scripts/python.exe -m desktop_pet.main`
+- 構成: `pet_state.py`（ステータス管理・永続化）、`controller.py`（アクション処理一元化）、`pet_window.py`（常駐ウィンドウ・UI・モーション）、`tray.py`（システムトレイ）、`effects.py`（パーティクルエフェクト）、`main.py`（エントリーポイント）
+- 画像: `desktop_pet/assets/pet/`。通常状態は`normal/`配下の3フレーム往復アニメーション、hungry/angryは静止画（`hungry.png`, `angry.png`）
+- 操作: 🍖餌やり / 👋なでる / ⏰時間操作（±10分/±1時間/±1日のサブメニュー）/ ❌終了（ウィンドウのボタン列＋システムトレイメニュー両方から可能）
+- モーション仕様:
+  - 餌やり（満腹でない時）: 食べかす演出→ハート（180ms加速、2600ms持続）→通常速度(400ms)復帰
+  - 餌やり（満腹時=あげすぎ）: 食べかす演出を出さず直接シェイク→通常速度復帰。mood-5のペナルティのみ（hungerは変化しない）
+  - なでる: バウンド+キラキラ→ハート（餌やりと共通、180ms加速）→通常速度復帰
+  - いずれもモーション中はボタン無効化、モーション完全終了（ハート消滅/シェイク終了）まで再有効化しない
+- アニメーション速度調整スライダーは実装済みだが非表示（確認済みのため）。ロジックは生きている。
+- **重要なバグ修正**: `PetState.feed()`/`pet()`から`apply_time_decay()`呼び出しを削除済み。時間経過による自然減少は定期タイマー（main.py）のみの責務。各アクションでは対象ステータスの加算のみ行う。
+
+## 画像生成の運用方針
+- 通常は `tools/image_gen/generate_image.py`（Pollinations.ai、認証不要・無料）を使う。
+- これまでOpenAI・Hugging Face・Google Gemini APIを試したが、いずれも無料枠が実質ゼロ/課金必須と判明し不採用（Pollinations.aiのみ動作確認済みの無料サービス）。
+- 高品質な画像が必要な場合は、Microsoft Copilotを**ユーザーが手動で**使い、生成した画像を人力でプロジェクトに取り込む運用（自動化は規約リスクのため行わない）。Claude側からも必要に応じてプロンプト案等を提案する。
+- 画像の保存先は `tools/generated_images/`（git管理外）。確定版はアプリ内の`desktop_pet/assets/pet/`等へ移動して使う。
 
 ## ディレクトリ構成
 - `CLAUDE.md` — プロジェクトスコープのルール
-- `prompt_logs/PROMPT_LOG.md` — ユーザーが送信した生のプロンプトを逐一記録
+- `prompt_logs/PROMPT_LOG.md` — ユーザーが送信した生のプロンプトを逐一記録（サブエージェントはこのファイルを変更しない）
 - `work_logs/STATUS.md`（本ファイル） — 現在の状況のスナップショット
-- `work_logs/archive/` — セッション区切りの作業要約（直近: `2026-10-13_05_image-gen-pollinations.md`）
-- `requirements_drafts/` — アプリ案4候補の要件定義ドラフト（`trpg_ai_gamemaster.md`, `desktop_pet_simulation.md`, `local_rag_chat.md`, `paint_tool.md`）
+- `work_logs/archive/` — セッション区切りの作業要約（直近: `2026-10-14_06_desktop-pet-motions.md`）
+- `requirements_drafts/` — アプリ案4候補の要件定義ドラフト（実質`desktop_pet_simulation.md`が採用）
+- `desktop_pet/` — デスクトップペットアプリ本体
 - `tools/image_gen/` — 画像生成ツール（Pollinations.ai版）
 - `tools/generated_images/` — 生成画像の保存先（git管理外）
 - `.claude/skills/` — `push-dev`, `push-all`（カスタムコマンド）, `_template/`（ひな型）
-- `.claude/agents/` — 汎用サブエージェント6種（`code-reviewer`, `test-writer`, `debugger`, `security-reviewer`, `doc-writer`, `changelog-writer`）, `_template.md`（ひな型）
-- `.claude/hooks/` — Hookスクリプト5種（フォーマット/危険コマンドブロック/秘密情報保護/状況読込/git状態注入）, `_template.sh`（ひな型）
-- `.venv/` — Python仮想環境（git管理外）、`requirements.txt`で依存管理
+- `.claude/agents/` — 汎用サブエージェント6種, `_template.md`（ひな型）
+- `.claude/hooks/` — Hookスクリプト5種, `_template.sh`（ひな型）
+- `.venv/` — Python仮想環境（git管理外）、`requirements.txt`で依存管理（PySide6等）
 
 ## 検討済みで見送った事項
-- `/clear` 実行時のarchive自動化（技術的制約により見送り、手動運用に統一）
-- `/clear` 自体をフックでブロックして確認を挟む案（確実な実現方法が見つからず見送り、ユーザーが手動で慎重に実行する運用）
+- `/clear` 実行時のarchive自動化、`/clear`自体のフックブロック（技術的制約により見送り）
+- 画像生成のHugging Face・Google Gemini API採用（無料枠なしのため見送り）
+- 画像生成・Copilotの自動操作（規約リスクのため見送り、手動運用に統一）
+
+## 運用上の注意（サブエージェントに毎回明記している内容）
+- サブエージェントは`prompt_logs/PROMPT_LOG.md`に追記しない（過去に複数回、親からの指示文をユーザー発言と誤記録する事故あり）
+- 指示されていない限り、ファイル名・フォルダ名のリネーム等スコープ外の変更をしない（過去に無断リネーム事故あり）
 
 ## 次にやること（未決事項）
-- プロジェクト種別（Python / Webアプリ）の確定。`requirements_drafts/`の4候補（TRPGアプリが現時点の最有力）を比較検討中
-- 種別確定後、CLAUDE.md の「言語・基本方針」セクションを具体化する
-- プロジェクト固有のサブエージェント・Skill・Hookは種別確定後に追加
+- 追加モーション・機能（ミニゲーム、会話機能等、要件定義書の拡張ロードマップ参照）
+- CLAUDE.mdの「プロジェクト概要」はPython/Webアプリ未確定のままの記述が残っているので、実態（デスクトップペット確定）に合わせて更新を検討してもよい

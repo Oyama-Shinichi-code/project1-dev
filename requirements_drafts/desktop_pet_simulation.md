@@ -67,7 +67,7 @@
 - ペットのドラッグ移動、画面端へのスナップなど、常駐アプリらしい挙動も検討
 
 ### 4.1 画像生成の活用方針
-ペットの見た目（表情差分・進化形態など）の画像は、必要に応じて `tools/image_gen/generate_image.py`（Pollinations.ai、認証不要・無料）で生成する。Pollinations.aiは匿名利用で15秒に1回のレート制限があるため、実行中にリアルタイム生成するのではなく、**開発時に事前生成してアセット化**し、`tools/generated_images/`からペット用の画像フォルダ（例: `assets/pet/`）へ確定版を移動して使う方針とする。
+ペットの見た目（表情差分・進化形態など）の画像は、必要に応じて `tools/image_gen/generate_image.py`（Pollinations.ai、認証不要・無料）で生成する。Pollinations.aiは匿名利用で15秒に1回のレート制限があるため、実行中にリアルタイム生成するのではなく、**開発時に事前生成してアセット化**し、`tools/generated_images/`からペット用の画像フォルダ（`desktop_pet/assets/pet/`）へ確定版を移動して使う方針とする。
 
 ## 5. 技術スタック
 

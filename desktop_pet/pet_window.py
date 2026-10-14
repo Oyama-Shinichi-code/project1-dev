@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRect, Qt, QTimer
 from PySide6.QtGui import QMouseEvent, QPixmap
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QProgressBar,
     QPushButton,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -28,14 +30,21 @@ from PySide6.QtWidgets import (
 from desktop_pet.controller import TIME_CONTROLS, PetController
 from desktop_pet.effects import ParticleEffectWidget, make_crumb_config, make_sparkle_config
 
-ASSETS_DIR = Path(__file__).parent.parent / "assets" / "pet"
+ASSETS_DIR = Path(__file__).parent / "assets" / "pet"
+NORMAL_ANIM_DIR = ASSETS_DIR / "normal"
+NORMAL_ANIM_FRAMES = ["normal_flame1.png", "normal_flame2.png", "normal_flame3.png"]
+NORMAL_ANIM_INTERVAL_MS = 400  # フレーム切り替え間隔(ms)
 PET_SIZE = 200  # 表示サイズ（元画像は512x512なので縮小表示）
 BUTTON_SIZE = 36  # ボタン列の1つあたりのサイズ(px)
 
 FEED_ICON_DURATION_MS = 1000  # 餌アイコンのフェードイン→表示→フェードアウトの合計時間
-HEART_DURATION_MS = 1300  # 完食ハート演出の時間
+HEART_DURATION_MS = 2600  # 完食ハート演出の時間（確認しやすいよう通常の2倍に設定）
 SHAKE_DURATION_MS = 600  # あげすぎシェイクの時間
 PET_BOUNCE_DURATION_MS = 500  # なでるモーション（バウンド）の時間
+HAPPY_ANIM_INTERVAL_MS = 180  # ハート演出中の加速アニメーション間隔(ms)
+
+ANIM_SPEED_SLIDER_MIN_MS = 100  # 速度調整スライダーの最小間隔(ms)
+ANIM_SPEED_SLIDER_MAX_MS = 1000  # 速度調整スライダーの最大間隔(ms)
 
 
 class PetWindow(QWidget):
@@ -46,6 +55,15 @@ class PetWindow(QWidget):
         self._drag_offset: QPoint | None = None
         self._feeding_in_progress = False  # 餌やりモーション中の多重実行防止フラグ
         self._petting_in_progress = False  # なでるモーション中の多重実行防止フラグ
+        self._current_expression: str | None = None  # 直前に表示した表情（再起動判定用）
+        self._normal_frame_index = 0
+        self._normal_frame_direction = 1  # 往復(ピンポン)の進行方向: +1 or -1
+        # モーション（餌やり/なでる）がアニメーションの一時停止・加速を制御している間は
+        # refresh_appearance側の表情変化によるタイマー起動/停止を無視する。
+        # これにより「カス散布中に満腹度が変わって表情が切り替わる」等のケースでも
+        # モーション側の制御（停止させたい/加速させたい）が優先され、意図しない
+        # タイマー再起動（速度リセットや二重起動）が起きない。
+        self._motion_controls_animation = False
 
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
@@ -55,16 +73,27 @@ class PetWindow(QWidget):
         self.label = QLabel(self)
         self.label.setFixedSize(PET_SIZE, PET_SIZE)
         self.label.setAlignment(Qt.AlignCenter)
+        # 透過PNGの透明部分からデスクトップが透けて見えるよう、ラベル自体の背景も透過にする
+        self.label.setStyleSheet("background: transparent;")
+
+        self._normal_anim_timer = QTimer(self)
+        self._normal_anim_timer.setInterval(NORMAL_ANIM_INTERVAL_MS)
+        self._normal_anim_timer.timeout.connect(self._advance_normal_frame)
 
         self._build_status_bars()
+        self._build_anim_speed_panel()
         self._build_button_bar()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         layout.addWidget(self.status_panel)
+        layout.addWidget(self.anim_speed_panel)
         layout.addWidget(self.label)
         layout.addWidget(self.button_bar)
+
+        # 速度確認作業は完了したため非表示化（ロジック・スライダー自体は残す）
+        self.anim_speed_panel.setVisible(False)
 
         x, y = self.state.window_position
         self.move(x, y)
@@ -128,6 +157,42 @@ class PetWindow(QWidget):
         if value >= 50:
             return "#4caf50" if value >= 75 else "#8bc34a"
         return "#f44336" if value < 25 else "#ff9800"
+
+    # --- アニメーション速度調整スライダーの構築（確認用・一時機能） ---
+    def _build_anim_speed_panel(self) -> None:
+        """通常アニメーションのフレーム切り替え間隔をリアルタイム調整するスライダー。
+
+        動作確認用の一時的なUIのため永続化はしない（再起動でデフォルト値に戻る）。
+        """
+        self.anim_speed_panel = QWidget(self)
+        self.anim_speed_panel.setStyleSheet(
+            "background-color: rgba(0, 0, 0, 110); border-radius: 8px;"
+        )
+        panel_layout = QHBoxLayout(self.anim_speed_panel)
+        panel_layout.setContentsMargins(6, 4, 6, 4)
+        panel_layout.setSpacing(4)
+
+        self.anim_speed_slider = QSlider(Qt.Horizontal, self.anim_speed_panel)
+        self.anim_speed_slider.setRange(ANIM_SPEED_SLIDER_MIN_MS, ANIM_SPEED_SLIDER_MAX_MS)
+        self.anim_speed_slider.setValue(NORMAL_ANIM_INTERVAL_MS)
+        self.anim_speed_slider.setFixedWidth(PET_SIZE - 60)
+        self.anim_speed_slider.valueChanged.connect(self._on_anim_speed_changed)
+
+        self.anim_speed_label = QLabel(f"{NORMAL_ANIM_INTERVAL_MS}ms", self.anim_speed_panel)
+        self.anim_speed_label.setStyleSheet("color: white; font-size: 10px;")
+        self.anim_speed_label.setFixedWidth(40)
+
+        panel_layout.addWidget(self.anim_speed_slider)
+        panel_layout.addWidget(self.anim_speed_label)
+
+    def _on_anim_speed_changed(self, value: int) -> None:
+        """スライダー変更を即座にラベル表示とタイマー間隔の両方へ反映する。
+
+        setInterval()は実行中のQTimerにも安全に呼べ、次回のtimeout予定から
+        新しい間隔が使われる（往復フレームのindex/directionには影響しない）。
+        """
+        self.anim_speed_label.setText(f"{value}ms")
+        self._normal_anim_timer.setInterval(value)
 
     # --- ボタン列の構築 ---
     def _build_button_bar(self) -> None:
@@ -203,16 +268,77 @@ class PetWindow(QWidget):
 
     # --- 見た目更新 ---
     def refresh_appearance(self) -> None:
-        """ステータスに応じて表示画像を切り替える（hungry > angry > normal）。"""
+        """ステータスに応じて表示画像を切り替える（hungry > angry > normal）。
+
+        on_changeコールバック経由でステータス変化のたびに毎回呼ばれるため、
+        表情が変わっていない場合は何もしない（アニメーションの二重起動・
+        フレーム位置リセットによるチラつきを防ぐ）。
+        """
         expression = self.state.current_expression()
-        image_path = ASSETS_DIR / f"{expression}.png"
+        if expression == self._current_expression:
+            self.refresh_status_bars()
+            return
+        self._current_expression = expression
+
+        if expression == "normal":
+            self._normal_frame_index = 0
+            self._normal_frame_direction = 1
+            self._set_pixmap_from_path(NORMAL_ANIM_DIR / NORMAL_ANIM_FRAMES[0])
+            # モーション側が一時停止/加速を制御している間は、ここでタイマーを
+            # 起動しない（モーション終了時の意図したタイミングで再開させる）
+            if not self._motion_controls_animation:
+                self._normal_anim_timer.start()
+        else:
+            if not self._motion_controls_animation:
+                self._normal_anim_timer.stop()
+            self._set_pixmap_from_path(ASSETS_DIR / f"{expression}.png")
+        self.refresh_status_bars()
+
+    def _set_pixmap_from_path(self, image_path: Path) -> None:
         pixmap = QPixmap(str(image_path))
         if not pixmap.isNull():
+            # KeepAspectRatio + SmoothTransformationでもアルファチャンネルは保持される
             pixmap = pixmap.scaled(
                 PET_SIZE, PET_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
             self.label.setPixmap(pixmap)
-        self.refresh_status_bars()
+
+    def _advance_normal_frame(self) -> None:
+        """通常状態の往復(ピンポン)アニメーションを1フレーム進める。
+
+        1→2→3→2→1→2→...のように端で折り返し、重複なく往復する。
+        """
+        last_index = len(NORMAL_ANIM_FRAMES) - 1
+        self._normal_frame_index += self._normal_frame_direction
+        if self._normal_frame_index >= last_index:
+            self._normal_frame_index = last_index
+            self._normal_frame_direction = -1
+        elif self._normal_frame_index <= 0:
+            self._normal_frame_index = 0
+            self._normal_frame_direction = 1
+        self._set_pixmap_from_path(NORMAL_ANIM_DIR / NORMAL_ANIM_FRAMES[self._normal_frame_index])
+
+    # --- モーション中の立ち絵アニメーション制御（餌やり/なでる共通） ---
+    def _pause_normal_animation(self) -> None:
+        """モーション開始時に通常アニメーションを停止し、以後の制御権をモーション側に渡す。
+
+        表情変化によるrefresh_appearance側のタイマー起動/停止はこのフラグが
+        立っている間は無視される（このメソッドと_resume_normal_animationの
+        対になる呼び出しでのみタイマーを操作する）。
+        """
+        self._motion_controls_animation = True
+        self._normal_anim_timer.stop()
+
+    def _resume_normal_animation(self, interval_ms: int) -> None:
+        """通常アニメーションを指定間隔で再開し、表情変化側への制御を返す。
+
+        通常速度への復帰は常にスライダーの現在値を基準速度として使う
+        （スライダー自体を「基準速度」とみなす設計）。
+        """
+        self._motion_controls_animation = False
+        if self._current_expression == "normal":
+            self._normal_anim_timer.setInterval(interval_ms)
+            self._normal_anim_timer.start()
 
     # --- 餌やりモーション ---
     def _set_buttons_enabled(self, enabled: bool) -> None:
@@ -227,6 +353,14 @@ class PetWindow(QWidget):
         """
         self._feeding_in_progress = True
         self._set_buttons_enabled(False)
+        self._pause_normal_animation()  # カス散布中はフレーム固定表示にする
+
+        # 既に満腹の場合は食べかすモーションを出さず、確定処理と演出のみ即座に行う
+        # （controller.feed()を呼ぶ前にstateを直接見て判定する）
+        if self.state.hunger >= 100:
+            self.controller.feed()  # hunger>=100での呼び出しのためoverfed=True確定
+            self._play_overfed_motion(on_complete=self._end_feed_motion)
+            return
 
         # 口元あたり（画像中央よりやや下）を基準位置とする
         mouth_x = self.label.x() + PET_SIZE // 2
@@ -265,17 +399,30 @@ class PetWindow(QWidget):
         fade_anim.start()
 
     def _finish_feed_motion(self) -> None:
-        """餌やりモーション終了時にステータス反映と後続演出を確定させる。"""
+        """餌やりモーション終了時にステータス反映と後続演出を確定させる。
+
+        ボタン再有効化・進行中フラグ解除は後続演出（ハート/シェイク）が
+        完全に終わるタイミングまで持ち越す（on_completで渡す）。
+        """
         overfed = self.controller.feed()
         if overfed:
-            self._play_overfed_motion()
+            self._play_overfed_motion(on_complete=self._end_feed_motion)
         else:
-            self._play_full_heart()
+            self._play_full_heart(on_complete=self._end_feed_motion)
+
+    def _end_feed_motion(self) -> None:
+        """餌やりモーション（演出含め）の完全終了時に進行中フラグとボタンを戻す。"""
         self._feeding_in_progress = False
         self._set_buttons_enabled(True)
 
-    def _play_full_heart(self) -> None:
-        """完食後、ハートが上に浮かびながらフワフワして消える演出。"""
+    def _play_full_heart(self, on_complete: Callable[[], None] | None = None) -> None:
+        """ハートが上に浮かびながらフワフワして消える演出（餌やり完食・なでる共通）。
+
+        表示開始と同時にアニメーションを180msへ加速し、消滅と同時に
+        通常速度（スライダーの基準値）へ戻す。on_completはハート消滅時に呼ばれる。
+        """
+        self._resume_normal_animation(HAPPY_ANIM_INTERVAL_MS)
+
         start_x = self.label.x() + PET_SIZE // 2 - 12
         start_y = self.label.y() + 10
 
@@ -302,13 +449,22 @@ class PetWindow(QWidget):
         opacity_anim.setKeyValueAt(0.7, 1.0)
         opacity_anim.setKeyValueAt(1.0, 0.0)
 
+        def on_heart_finished() -> None:
+            heart.deleteLater()
+            self._resume_normal_animation(self.anim_speed_slider.value())
+            if on_complete is not None:
+                on_complete()
+
         self._heart_ref = heart  # GC防止
-        opacity_anim.finished.connect(heart.deleteLater)
+        opacity_anim.finished.connect(on_heart_finished)
         pos_anim.start()
         opacity_anim.start()
 
-    def _play_overfed_motion(self) -> None:
-        """あげすぎ時の「困る/嫌がる」モーション（絵文字表示＋画像の左右シェイク）。"""
+    def _play_overfed_motion(self, on_complete: Callable[[], None] | None = None) -> None:
+        """あげすぎ時の「困る/嫌がる」モーション（絵文字表示＋画像の左右シェイク）。
+
+        on_completはシェイク終了時に呼ばれる。
+        """
         center_x = self.label.x() + PET_SIZE // 2 - 14
         top_y = self.label.y() - 4
 
@@ -330,6 +486,11 @@ class PetWindow(QWidget):
             if index >= len(offsets):
                 self.label.setContentsMargins(0, 0, 0, 0)
                 annoyed_icon.deleteLater()
+                # あげすぎ時はハートが出ないため180ms加速は行わず、
+                # シェイク終了で通常速度のまま再開する
+                self._resume_normal_animation(self.anim_speed_slider.value())
+                if on_complete is not None:
+                    on_complete()
                 return
             dx = offsets[index]
             left = max(0, dx)
@@ -340,6 +501,11 @@ class PetWindow(QWidget):
         shake_step()
 
     # --- なでるモーション ---
+    def _end_pet_motion(self) -> None:
+        """なでるモーション（ハート演出含め）の完全終了時に進行中フラグとボタンを戻す。"""
+        self._petting_in_progress = False
+        self._set_buttons_enabled(True)
+
     def _start_pet_motion(self) -> None:
         """なでるモーションを開始する。
 
@@ -349,6 +515,7 @@ class PetWindow(QWidget):
         """
         self._petting_in_progress = True
         self._set_buttons_enabled(False)
+        self._pause_normal_animation()  # バウンド＋キラキラ中はフレーム固定表示にする
         self.controller.pet()
 
         # 画像をY軸方向に軽くバウンドさせる。
@@ -361,8 +528,9 @@ class PetWindow(QWidget):
         def bounce_step(index: int = 0) -> None:
             if index >= len(offsets):
                 self.label.setContentsMargins(0, 0, 0, 0)
-                self._petting_in_progress = False
-                self._set_buttons_enabled(True)
+                # ボタン再有効化・フラグ解除はハート消滅時まで持ち越す
+                # バウンド終了後にハート演出（表示開始で180msへ加速、消滅で通常速度に復帰）
+                self._play_full_heart(on_complete=self._end_pet_motion)
                 return
             dy = offsets[index]
             top = max(0, -dy)

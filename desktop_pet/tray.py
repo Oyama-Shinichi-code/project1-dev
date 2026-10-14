@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from desktop_pet.controller import TIME_CONTROLS, PetController
 
-ASSETS_DIR = Path(__file__).parent.parent / "assets" / "pet"
+ASSETS_DIR = Path(__file__).parent / "assets" / "pet"
 
 
 class PetTray(QSystemTrayIcon):
