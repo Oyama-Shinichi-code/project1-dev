@@ -3,8 +3,8 @@
 - フレームレス・最前面・背景透過
 - クリックでなでるアクション
 - ドラッグで移動
-- 画像下のボタン列（餌やり/なでる/時間操作/終了）
-- ステータスゲージ（満腹度/機嫌/体力）
+- 画像下のボタン列（餌やり/なでる/時間操作/終了、折りたたみ可）
+- ステータスゲージ（満腹度/機嫌/体力、折りたたみ可）
 - 餌やりモーション（餌アイコン表示＋食べかすパーティクル＋完食ハート/あげすぎシェイク）
 - なでるモーション（画像バウンド＋キラキラパーティクル）
 """
@@ -13,8 +13,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRect, Qt, QTimer
-from PySide6.QtGui import QCursor, QMouseEvent, QPixmap
+from PySide6.QtCore import (
+    QEasingCurve,
+    QParallelAnimationGroup,
+    QPoint,
+    QPropertyAnimation,
+    QRect,
+    Qt,
+    QTimer,
+)
+from PySide6.QtGui import QColor, QCursor, QMouseEvent, QPainter, QPaintEvent, QPen, QPixmap, QShowEvent
 from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHBoxLayout,
@@ -48,7 +56,12 @@ ANIM_SPEED_SLIDER_MAX_MS = 1000  # 速度調整スライダーの最大間隔(ms
 
 MIN_SCALE = 0.5  # 最小スケール（PET_SIZE=200基準で表示100px相当）
 MAX_SCALE = 2.0  # 最大スケール（PET_SIZE=200基準で表示400px相当）
-RESIZE_GRIP_SIZE = 20  # 右下角のリサイズグリップのサイズ(px、ウィンドウ座標系・スケール不問)
+RESIZE_GRIP_SIZE = 32  # 角のリサイズグリップのサイズ(px、ウィンドウ座標系・スケール不問)
+# 以前20pxだったが、見た目のデザインが無い状態(design_visible=False)だと
+# マウスを正確に合わせづらく「機能していないように見える」ため、当たり判定を広げた。
+
+MENU_TOGGLE_SIZE = 24  # メニュートグルボタンのサイズ(px、スケール不問の固定値)
+MENU_ANIM_DURATION_MS = 240  # メニュー開閉アニメーションの時間(ms)
 
 
 class _ResizeGrip(QWidget):
@@ -67,12 +80,23 @@ class _ResizeGrip(QWidget):
         "bottom_left": Qt.SizeBDiagCursor,
     }
 
-    def __init__(self, window: "PetWindow", corner: str) -> None:
+    def __init__(self, window: "PetWindow", corner: str, design_visible: bool = True) -> None:
         super().__init__(window)
         self._window = window
         self._corner = corner
+        # デザイン（L字マーク）の表示/非表示。OFFでもクリック判定（リサイズ機能）には影響しない。
+        self.design_visible = design_visible
         self.setFixedSize(RESIZE_GRIP_SIZE, RESIZE_GRIP_SIZE)
         self.setCursor(QCursor(self._CURSOR_BY_CORNER[corner]))
+        # 親(PetWindow)がWA_TranslucentBackgroundのため、素のQWidgetだと
+        # このウィジェットも半透明合成扱いになり、alphaの薄い領域でクリックが
+        # 背後（PetWindowのmousePressEvent等）へ素通りすることがある。
+        # このウィジェット自身にもWA_TranslucentBackgroundを与えてピクセル単位の
+        # 透過合成にすることで、alpha=1のごく薄い塗り部分だけがクリック判定として
+        # 機能しつつ、見た目は背景に溶け込んで四角い継ぎ目が出ないようにする。
+        # （WA_OpaquePaintEventを使うと矩形全体が不透明ブロックとして合成され、
+        # design_visible=False時でも四角く見えてしまったため、こちらに変更）
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
@@ -81,6 +105,41 @@ class _ResizeGrip(QWidget):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if event.buttons() & Qt.LeftButton:
             self._window.update_resize(event.globalPosition().toPoint())
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        """角の位置にL字型のコーナーマークを描き、リサイズ可能な場所だと一目で分かるようにする。
+
+        白い縁取り＋黒い線の二重描画にすることで、デスクトップの壁紙がどんな色でも視認できる。
+        design_visible=Falseの場合はL字マークは描かないが、完全な透明(alpha=0)のまま
+        にすると、親ウィンドウのWA_TranslucentBackgroundの影響でこの領域のクリックが
+        背後へ素通りしてしまう（Windowsの透過ウィンドウで実機クリックのみ発生し、
+        QTestでのシミュレーションでは再現されない問題だった）。そのため、ほぼ見えない
+        ごく薄いalphaで塗りつぶし、クリック判定だけは機能させる。
+        """
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        if not self.design_visible:
+            painter.fillRect(self.rect(), QColor(0, 0, 0, 1))
+            return
+        # マーク自体はクリック当たり判定(RESIZE_GRIP_SIZE)より小さく描き、
+        # 見た目の主張を抑える（当たり判定サイズは変更しない）。
+        margin = 8
+        length = (RESIZE_GRIP_SIZE - margin * 2) // 2
+        if self._corner == "top_left":
+            points = [(margin, margin + length), (margin, margin), (margin + length, margin)]
+        else:  # top_right
+            points = [
+                (RESIZE_GRIP_SIZE - margin - length, margin),
+                (RESIZE_GRIP_SIZE - margin, margin),
+                (RESIZE_GRIP_SIZE - margin, margin + length),
+            ]
+        for color, width in ((Qt.white, 3), (Qt.black, 1)):
+            pen = QPen(color)
+            pen.setWidth(width)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(*points[0], *points[1])
+            painter.drawLine(*points[1], *points[2])
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
@@ -111,6 +170,13 @@ class PetWindow(QWidget):
         # モーション側の制御（停止させたい/加速させたい）が優先され、意図しない
         # タイマー再起動（速度リセットや二重起動）が起きない。
         self._motion_controls_animation = False
+        self._menu_open = False  # アクションボタン列（折りたたみメニュー）の開閉状態
+        self._grip_design_visible = True  # リサイズグリップのL字デザイン表示状態(top_rightは対象外・常にFalse)
+        self._menu_animation_group: QParallelAnimationGroup | None = None  # 実行中のメニュー開閉アニメーション(多重開始防止用に保持)
+        self._button_bar_open_height = 0  # 開いた時のbutton_barの高さ(px)。_apply_scaleで確定する
+        self._status_open = False  # ステータスパネル（折りたたみメニュー）の開閉状態
+        self._status_animation_group: QParallelAnimationGroup | None = None  # 実行中のステータスパネル開閉アニメーション(多重開始防止用に保持)
+        self._status_panel_open_height = 0  # 開いた時のstatus_panelの高さ(px)。_apply_scaleで確定する
 
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
@@ -130,6 +196,9 @@ class PetWindow(QWidget):
         self._build_status_bars()
         self._build_anim_speed_panel()
         self._build_button_bar()
+        self._build_menu_toggle_button()
+        self._build_status_toggle_button()
+        self._build_grip_design_toggle_button()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -139,15 +208,29 @@ class PetWindow(QWidget):
         layout.addWidget(self.label)
         layout.addWidget(self.button_bar)
 
-        # リサイズグリップ（四隅）はレイアウト管理外の子ウィジェットとして絶対配置する
-        # （他のウィジェットの上に重ねて表示するため、layoutには追加しない）
+        # メニュー・ステータスパネルは初期状態で閉じておく（maximumHeight=0で高さ0に折りたたむ）
+        self.button_bar.setMaximumHeight(0)
+        self.status_panel.setMaximumHeight(0)
+
+        # リサイズグリップ（四隅）・トグルボタン類はレイアウト管理外の
+        # 子ウィジェットとして絶対配置する（他のウィジェットの上に重ねて表示するため、layoutには追加しない）
+        # 左下・右下はメニュー/ステータストグルボタンと重なる位置にあり、
+        # トグルボタンが前面に来ることでグリップがマウスイベントを受け取れず
+        # 機能しないことがあったため、上2角のみをリサイズ対象にする。
+        # top_rightはデザイン（L字マーク）を常に非表示にする（機能は他の角と同様に動作する）
         self._resize_grips = {
-            corner: _ResizeGrip(self, corner)
-            for corner in ("top_left", "top_right", "bottom_left", "bottom_right")
+            "top_left": _ResizeGrip(self, "top_left", design_visible=True),
+            "top_right": _ResizeGrip(self, "top_right", design_visible=False),
         }
         for grip in self._resize_grips.values():
             grip.show()
             grip.raise_()
+        self.menu_toggle_button.show()
+        self.menu_toggle_button.raise_()
+        self.status_toggle_button.show()
+        self.status_toggle_button.raise_()
+        self.grip_design_toggle_button.show()
+        self.grip_design_toggle_button.raise_()
 
         # 速度確認作業は完了したため非表示化（ロジック・スライダー自体は残す）
         self.anim_speed_panel.setVisible(False)
@@ -173,6 +256,15 @@ class PetWindow(QWidget):
         MIN_SCALE〜MAX_SCALEにクランプしてから反映するため、呼び出し側は
         範囲外の値を渡しても安全。
         """
+        # メニュー開閉アニメーションとリサイズ操作が同時に走ると、geometryの
+        # 設定元が競合して状態が壊れうるため、リサイズ時は進行中のアニメーションを打ち切る
+        if self._menu_animation_group is not None:
+            self._menu_animation_group.stop()
+            self._menu_animation_group = None
+        if self._status_animation_group is not None:
+            self._status_animation_group.stop()
+            self._status_animation_group = None
+
         self._scale = max(MIN_SCALE, min(MAX_SCALE, scale))
         pet_size = self._pet_size()
         button_size = self._button_size()
@@ -204,6 +296,13 @@ class PetWindow(QWidget):
         # （中のボタンをsetFixedSizeで縮めただけではbutton_barのsizeHint
         # キャッシュが追従せず、古い大きい幅のまま残ってしまう）
         self.button_bar.setFixedWidth(pet_size)
+        # 折りたたみメニューの高さはボタンサイズに応じて変わるため、
+        # 開いている時はスケールに応じた新しい高さに更新する。
+        # 閉じている時はmaximumHeight=0を維持し（折りたたみ状態を壊さない）、
+        # 「必要な高さ」だけを_menu_open_height()用に記録しておく。
+        self._button_bar_open_height = self.button_bar.sizeHint().height()
+        if self._menu_open:
+            self.button_bar.setMaximumHeight(self._button_bar_open_height)
 
         gauge_height = max(4, int(8 * self._scale))
         label_font_px = max(7, int(10 * self._scale))
@@ -222,6 +321,11 @@ class PetWindow(QWidget):
         for text_label in self._status_text_labels:
             text_label.setStyleSheet(f"color: white; font-size: {label_font_px}px;")
             text_label.setFixedWidth(label_width)
+        # button_barと同様、折りたたみの「開いた時の高さ」をスケールに応じて更新する。
+        # 閉じている時はmaximumHeight=0を維持する（折りたたみ状態を壊さない）。
+        self._status_panel_open_height = self.status_panel.sizeHint().height()
+        if self._status_open:
+            self.status_panel.setMaximumHeight(self._status_panel_open_height)
 
         # レイアウト管理下の子ウィジェットのサイズ変更をウィンドウ全体に反映させる。
         # adjustSize()単体だと、一度大きくなったウィンドウが縮小方向にはうまく
@@ -231,19 +335,14 @@ class PetWindow(QWidget):
         self.setMaximumSize(16777215, 16777215)  # QWIDGETSIZE_MAX（実質無制限）
         self.layout().invalidate()
         self.layout().activate()
-        self.adjustSize()
-        # ウィンドウサイズが確定した後、リサイズグリップ（四隅）を追従させる
-        w, h = self.width(), self.height()
-        grip_positions = {
-            "top_left": (0, 0),
-            "top_right": (w - RESIZE_GRIP_SIZE, 0),
-            "bottom_left": (0, h - RESIZE_GRIP_SIZE),
-            "bottom_right": (w - RESIZE_GRIP_SIZE, h - RESIZE_GRIP_SIZE),
-        }
-        for corner, (gx, gy) in grip_positions.items():
-            grip = self._resize_grips[corner]
-            grip.move(gx, gy)
-            grip.raise_()
+        # adjustSize()はレイアウト外の絶対配置の子ウィジェット（リサイズグリップ・
+        # トグルボタン類）の現在位置も暗黙的に考慮してしまい、縮小前の古い位置が
+        # 残っていると最小幅がそれに引っ張られて縮小できないことがあった。
+        # そのため、レイアウトのsizeHintから直接resize()してウィンドウサイズを
+        # 確定させる（絶対配置の子ウィジェットの影響を受けない）。
+        self.resize(self.layout().sizeHint())
+        # ウィンドウサイズが確定した後、グリップ・トグルボタン類を追従させる
+        self._reposition_overlay_widgets()
 
     # --- ステータスゲージの構築 ---
     def _build_status_bars(self) -> None:
@@ -389,6 +488,231 @@ class PetWindow(QWidget):
             button.setFixedSize(BUTTON_SIZE, BUTTON_SIZE)
             button.setStyleSheet(button_style)
             bar_layout.addWidget(button)
+
+    # --- メニュートグルボタンの構築・開閉制御 ---
+    def _build_menu_toggle_button(self) -> None:
+        """常時表示する小さな開閉ボタン（☰）。クリックでbutton_barの開閉をトグルする。"""
+        self.menu_toggle_button = QPushButton("☰", self)
+        self.menu_toggle_button.setToolTip("メニュー")
+        self.menu_toggle_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
+        # 白い背景の上でも視認できるよう、枠線と影でアイコンの輪郭を強調する
+        # （半透明の背景だけだと白背景のデスクトップにほぼ溶け込んでしまうため）
+        self.menu_toggle_button.setStyleSheet(
+            "QPushButton {"
+            " background-color: rgba(60, 60, 60, 200);"
+            " border: 1.5px solid rgba(255, 255, 255, 220);"
+            " border-radius: 6px; font-size: 14px; color: white;"
+            "}"
+            "QPushButton:hover { background-color: rgba(90, 90, 90, 220); }"
+        )
+        self.menu_toggle_button.clicked.connect(self._toggle_menu)
+
+    def _build_status_toggle_button(self) -> None:
+        """常時表示する小さな開閉ボタン（📊）。クリックでstatus_panelの開閉をトグルする。
+
+        見た目はmenu_toggle_buttonと統一し、縦に積み上がる1つ目のボタンとして配置する。
+        """
+        self.status_toggle_button = QPushButton("📊", self)
+        self.status_toggle_button.setToolTip("ステータス")
+        self.status_toggle_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
+        self.status_toggle_button.setStyleSheet(
+            "QPushButton {"
+            " background-color: rgba(60, 60, 60, 200);"
+            " border: 1.5px solid rgba(255, 255, 255, 220);"
+            " border-radius: 6px; font-size: 14px; color: white;"
+            "}"
+            "QPushButton:hover { background-color: rgba(90, 90, 90, 220); }"
+        )
+        self.status_toggle_button.clicked.connect(self._toggle_status_panel)
+
+    def _reposition_menu_toggle_button(self) -> None:
+        """メニュートグルボタンをペット画像(label)の右下隅を基準に配置する。
+
+        以前はウィンドウ全体の右下を基準にしていたため、メニュー開閉で
+        ウィンドウの高さが変わるとボタン列の位置まで降りてきてしまい、
+        さらにgeometryアニメーション中は再配置されず古い位置に取り残されていた。
+        labelの位置・サイズはメニュー開閉の影響を受けないため、これを基準にすれば
+        どちらの問題も解消する（アニメーション中も追従処理が不要になる）。
+        """
+        pet_right = self.label.x() + self.label.width()
+        pet_bottom = self.label.y() + self.label.height()
+        self.menu_toggle_button.move(
+            pet_right - MENU_TOGGLE_SIZE - 4, pet_bottom - MENU_TOGGLE_SIZE - 4
+        )
+        self.menu_toggle_button.raise_()
+
+    def _reposition_status_toggle_button(self) -> None:
+        """ステータストグルボタンをmenu_toggle_buttonの真上に縦積みで配置する。
+
+        今後ボタンが増える方針のため、右下を起点にy座標をMENU_TOGGLE_SIZE+4ずつ
+        積み上げていく想定（このボタンはmenu_toggle_buttonの1段上）。
+        """
+        pet_right = self.label.x() + self.label.width()
+        pet_bottom = self.label.y() + self.label.height()
+        self.status_toggle_button.move(
+            pet_right - MENU_TOGGLE_SIZE - 4,
+            pet_bottom - MENU_TOGGLE_SIZE - 4 - (MENU_TOGGLE_SIZE + 4),
+        )
+        self.status_toggle_button.raise_()
+
+    def _build_grip_design_toggle_button(self) -> None:
+        """リサイズグリップのL字デザインの表示/非表示を切り替えるボタン（👁）。
+
+        OFFにしてもリサイズ機能自体（クリック判定）は常に動作する。
+        見た目はmenu_toggle_button/status_toggle_buttonと統一し、縦積みの3段目に置く。
+        """
+        self.grip_design_toggle_button = QPushButton("👁", self)
+        self.grip_design_toggle_button.setToolTip("リサイズハンドルの表示切り替え")
+        self.grip_design_toggle_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
+        self.grip_design_toggle_button.setStyleSheet(
+            "QPushButton {"
+            " background-color: rgba(60, 60, 60, 200);"
+            " border: 1.5px solid rgba(255, 255, 255, 220);"
+            " border-radius: 6px; font-size: 14px; color: white;"
+            "}"
+            "QPushButton:hover { background-color: rgba(90, 90, 90, 220); }"
+        )
+        self.grip_design_toggle_button.clicked.connect(self._toggle_grip_design)
+
+    def _reposition_grip_design_toggle_button(self) -> None:
+        """グリップデザイン切り替えボタンをstatus_toggle_buttonのさらに1段上に配置する。"""
+        pet_right = self.label.x() + self.label.width()
+        pet_bottom = self.label.y() + self.label.height()
+        self.grip_design_toggle_button.move(
+            pet_right - MENU_TOGGLE_SIZE - 4,
+            pet_bottom - MENU_TOGGLE_SIZE - 4 - (MENU_TOGGLE_SIZE + 4) * 2,
+        )
+        self.grip_design_toggle_button.raise_()
+
+    def _toggle_grip_design(self) -> None:
+        """全リサイズグリップのL字デザイン表示/非表示を一括で切り替える。
+
+        top_rightは常にデザイン非表示固定のため対象外にする
+        （元々design_visible=Falseなので、切り替えても見た目に変化が出ない）。
+        """
+        self._grip_design_visible = not self._grip_design_visible
+        self._update_top_left_grip_design()
+
+    def _update_top_left_grip_design(self) -> None:
+        """top_leftグリップの実際のデザイン表示状態を再計算して反映する。
+
+        ユーザーが👁ボタンで設定したON/OFF(_grip_design_visible)と、
+        status_panel表示中は強制的にデザインを隠す仕様の両方を踏まえて
+        最終的な表示状態を決める（クリック判定=リサイズ機能自体は影響を受けない）。
+        """
+        grip = self._resize_grips["top_left"]
+        grip.design_visible = self._grip_design_visible and not self._status_open
+        grip.update()
+
+    def _raise_resize_grips(self) -> None:
+        """リサイズグリップを最前面に上げ直す。
+
+        status_panel/button_barの開閉アニメーションに伴うレイアウト再計算で、
+        グリップが他のウィジェットの下に隠れてクリックを受け付けなくなることが
+        あったため、開閉操作のたびに明示的に呼び直して確実に最前面を維持する。
+        """
+        for grip in self._resize_grips.values():
+            grip.raise_()
+
+    def _toggle_menu(self) -> None:
+        """button_barの開閉状態をアニメーション付きで切り替える。
+
+        開閉中にbutton_barの高さとウィンドウ全体の高さを同時にアニメーションさせるため、
+        QParallelAnimationGroupで2本のQPropertyAnimationを束ねて実行する。
+        """
+        self._raise_resize_grips()
+        self._menu_open = not self._menu_open
+        target_bar_height = self._button_bar_open_height if self._menu_open else 0
+
+        current_geo = self.geometry()
+        height_diff = target_bar_height - self.button_bar.maximumHeight()
+        target_geo = QRect(current_geo.x(), current_geo.y(), current_geo.width(), current_geo.height() + height_diff)
+
+        # 既存のアニメーションが進行中なら打ち切ってから新しいものを開始する
+        # （連打された場合に古いアニメーションの終了処理と競合しないようにする）
+        if self._menu_animation_group is not None:
+            self._menu_animation_group.stop()
+
+        bar_anim = QPropertyAnimation(self.button_bar, b"maximumHeight", self)
+        bar_anim.setDuration(MENU_ANIM_DURATION_MS)
+        bar_anim.setStartValue(self.button_bar.maximumHeight())
+        bar_anim.setEndValue(target_bar_height)
+        bar_anim.setEasingCurve(QEasingCurve.InOutCubic)
+
+        geo_anim = QPropertyAnimation(self, b"geometry", self)
+        geo_anim.setDuration(MENU_ANIM_DURATION_MS)
+        geo_anim.setStartValue(current_geo)
+        geo_anim.setEndValue(target_geo)
+        geo_anim.setEasingCurve(QEasingCurve.InOutCubic)
+
+        group = QParallelAnimationGroup(self)
+        group.addAnimation(bar_anim)
+        group.addAnimation(geo_anim)
+        group.finished.connect(self._on_menu_animation_finished)
+        self._menu_animation_group = group
+        group.start()
+
+    def _on_menu_animation_finished(self) -> None:
+        """メニュー開閉アニメーション終了時、サイズ制約の後始末とグリップ再配置を行う。
+
+        geometryアニメーション中はsetMaximumSizeの制約を外していないため、
+        adjustSize()は使わずジオメトリをそのまま確定値とする。グリップ・
+        トグルボタンの位置だけ最新のウィンドウサイズに追従させる。
+        """
+        self._menu_animation_group = None
+        self._reposition_overlay_widgets()
+
+    def _toggle_status_panel(self) -> None:
+        """status_panelの開閉状態をアニメーション付きで切り替える（_toggle_menuと同じ仕組み）。
+
+        button_barとは別のアニメーショングループ・開閉フラグで管理するため、
+        両者は独立して開閉できる（同時にアニメーションしても互いの
+        QPropertyAnimationは別オブジェクトなので干渉しない）。
+        """
+        self._raise_resize_grips()
+        self._status_open = not self._status_open
+        self._update_top_left_grip_design()
+        target_panel_height = self._status_panel_open_height if self._status_open else 0
+
+        current_geo = self.geometry()
+        height_diff = target_panel_height - self.status_panel.maximumHeight()
+        # status_panelはウィンドウ最上部にあるため、button_barと同じ「下端が伸びる」
+        # 計算のままだと上端固定で下方向にせり出して見える。ペット画像やボタン列の
+        # 位置は変えずに「下から上に」展開させたいので、高さが増える分だけy座標を
+        # 上へ動かし、ウィンドウの下端を固定点として扱う。
+        target_geo = QRect(
+            current_geo.x(),
+            current_geo.y() - height_diff,
+            current_geo.width(),
+            current_geo.height() + height_diff,
+        )
+
+        if self._status_animation_group is not None:
+            self._status_animation_group.stop()
+
+        panel_anim = QPropertyAnimation(self.status_panel, b"maximumHeight", self)
+        panel_anim.setDuration(MENU_ANIM_DURATION_MS)
+        panel_anim.setStartValue(self.status_panel.maximumHeight())
+        panel_anim.setEndValue(target_panel_height)
+        panel_anim.setEasingCurve(QEasingCurve.InOutCubic)
+
+        geo_anim = QPropertyAnimation(self, b"geometry", self)
+        geo_anim.setDuration(MENU_ANIM_DURATION_MS)
+        geo_anim.setStartValue(current_geo)
+        geo_anim.setEndValue(target_geo)
+        geo_anim.setEasingCurve(QEasingCurve.InOutCubic)
+
+        group = QParallelAnimationGroup(self)
+        group.addAnimation(panel_anim)
+        group.addAnimation(geo_anim)
+        group.finished.connect(self._on_status_animation_finished)
+        self._status_animation_group = group
+        group.start()
+
+    def _on_status_animation_finished(self) -> None:
+        """status_panel開閉アニメーション終了時、サイズ制約の後始末とグリップ再配置を行う。"""
+        self._status_animation_group = None
+        self._reposition_overlay_widgets()
 
     # --- ボタンのクリックハンドラ（実処理はcontrollerに委譲） ---
     def _on_feed_clicked(self) -> None:
@@ -766,11 +1090,39 @@ class PetWindow(QWidget):
         else:  # bottom_left
             new_pos = QPoint(anchor.x() - w, anchor.y())
         self.move(new_pos)
+        # move()の前にグリップ位置を計算すると、ウィンドウ位置確定前の状態を
+        # 基準にしてしまいズレることがあったため、move()の後に再配置する。
+        self._reposition_overlay_widgets()
+
+    def _reposition_overlay_widgets(self) -> None:
+        """リサイズグリップ・メニュー/ステータストグルボタンを現在のウィンドウサイズに追従させる。"""
+        w, h = self.width(), self.height()
+        grip_positions = {
+            "top_left": (0, 0),
+            "top_right": (w - RESIZE_GRIP_SIZE, 0),
+        }
+        for corner, (gx, gy) in grip_positions.items():
+            grip = self._resize_grips[corner]
+            grip.move(gx, gy)
+            grip.raise_()
+        self._reposition_menu_toggle_button()
+        self._reposition_status_toggle_button()
+        self._reposition_grip_design_toggle_button()
 
     def end_resize(self) -> None:
         self._resizing = False
         self._resize_start_pos = None
         self._resize_corner = None
+
+    def showEvent(self, event: QShowEvent) -> None:
+        """ウィンドウが実際に画面へ表示された直後、メニュートグルボタンを再配置する。
+
+        __init__時点ではウィンドウがまだ表示されておらずレイアウトが未確定のため、
+        labelのx()/y()が正しい値を返さず、ボタンが見えない位置に置かれてしまう。
+        showEventはレイアウト確定後に発生するため、ここで再配置すれば確実に直る。
+        """
+        super().showEvent(event)
+        self._reposition_overlay_widgets()
 
     # --- マウス操作: クリックでなでる / ドラッグで移動 ---
     def mousePressEvent(self, event: QMouseEvent) -> None:
