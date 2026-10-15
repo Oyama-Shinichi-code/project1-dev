@@ -138,29 +138,35 @@ def _star_polygon(cx: float, cy: float, size: float) -> QPolygonF:
     return QPolygonF(points)
 
 
-def make_crumb_config() -> ParticleEffectConfig:
-    """餌やりモーション用: 食べかすが飛び散る設定。"""
+def make_crumb_config(scale: float = 1.0) -> ParticleEffectConfig:
+    """餌やりモーション用: 食べかすが飛び散る設定。
+
+    scale: ウィンドウの拡大縮小に合わせて粒のサイズ・速度を比例させる係数。
+    """
     return ParticleEffectConfig(
         colors=CRUMB_COLORS,
         count_range=(5, 8),
         lifetime_ms=1000,
         interval_ms=30,
-        speed_range=(0.6, 1.8),
-        size_range=(3, 6),
-        gravity=0.05,
+        speed_range=(0.6 * scale, 1.8 * scale),
+        size_range=(3 * scale, 6 * scale),
+        gravity=0.05 * scale,
         shape="mixed",
     )
 
 
-def make_sparkle_config() -> ParticleEffectConfig:
-    """なでるモーション用: キラキラが軽やかに浮かび上がって消える設定。"""
+def make_sparkle_config(scale: float = 1.0) -> ParticleEffectConfig:
+    """なでるモーション用: キラキラが軽やかに浮かび上がって消える設定。
+
+    scale: ウィンドウの拡大縮小に合わせて粒のサイズ・速度を比例させる係数。
+    """
     return ParticleEffectConfig(
         colors=SPARKLE_COLORS,
         count_range=(4, 6),
         lifetime_ms=700,
         interval_ms=30,
-        speed_range=(0.4, 1.0),
-        size_range=(3, 5),
-        gravity=-0.03,  # 負の重力でふわっと上に浮かぶ動きにする
+        speed_range=(0.4 * scale, 1.0 * scale),
+        size_range=(3 * scale, 5 * scale),
+        gravity=-0.03 * scale,  # 負の重力でふわっと上に浮かぶ動きにする
         shape="star",
     )

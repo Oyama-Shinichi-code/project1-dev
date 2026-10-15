@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRect, Qt, QTimer
-from PySide6.QtGui import QMouseEvent, QPixmap
+from PySide6.QtGui import QCursor, QMouseEvent, QPixmap
 from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHBoxLayout,
@@ -46,6 +46,46 @@ HAPPY_ANIM_INTERVAL_MS = 180  # ハート演出中の加速アニメーション
 ANIM_SPEED_SLIDER_MIN_MS = 100  # 速度調整スライダーの最小間隔(ms)
 ANIM_SPEED_SLIDER_MAX_MS = 1000  # 速度調整スライダーの最大間隔(ms)
 
+MIN_SCALE = 0.5  # 最小スケール（PET_SIZE=200基準で表示100px相当）
+MAX_SCALE = 2.0  # 最大スケール（PET_SIZE=200基準で表示400px相当）
+RESIZE_GRIP_SIZE = 20  # 右下角のリサイズグリップのサイズ(px、ウィンドウ座標系・スケール不問)
+
+
+class _ResizeGrip(QWidget):
+    """ウィンドウの四隅に重ねて置く専用のリサイズハンドル。
+
+    ボタン列やステータスパネルと重なる位置にあるため、通常のPetWindow.mouseMoveEvent内の
+    座標判定では他のウィジェットにイベントが吸収されてカーソル変化・ドラッグ判定ができない。
+    専用の小さな子ウィジェットとして独立させることで、確実にマウスイベントを受け取る。
+    """
+
+    # 角ごとのカーソル形状（左上/右下は同じ斜め、右上/左下は逆の斜め）
+    _CURSOR_BY_CORNER = {
+        "top_left": Qt.SizeFDiagCursor,
+        "bottom_right": Qt.SizeFDiagCursor,
+        "top_right": Qt.SizeBDiagCursor,
+        "bottom_left": Qt.SizeBDiagCursor,
+    }
+
+    def __init__(self, window: "PetWindow", corner: str) -> None:
+        super().__init__(window)
+        self._window = window
+        self._corner = corner
+        self.setFixedSize(RESIZE_GRIP_SIZE, RESIZE_GRIP_SIZE)
+        self.setCursor(QCursor(self._CURSOR_BY_CORNER[corner]))
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self._window.begin_resize(event.globalPosition().toPoint(), self._corner)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if event.buttons() & Qt.LeftButton:
+            self._window.update_resize(event.globalPosition().toPoint())
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self._window.end_resize()
+
 
 class PetWindow(QWidget):
     def __init__(self, controller: PetController) -> None:
@@ -53,9 +93,16 @@ class PetWindow(QWidget):
         self.controller = controller
         self.state = controller.state
         self._drag_offset: QPoint | None = None
+        self._scale = 1.0  # 表示スケール係数（1.0が基準サイズ、PET_SIZE等の定数に乗算して使う）
+        self._resizing = False  # 角ドラッグでリサイズ中かどうか
+        self._resize_start_pos: QPoint | None = None  # リサイズ開始時のグローバル座標
+        self._resize_start_scale = 1.0  # リサイズ開始時のスケール
+        self._resize_corner: str | None = None  # ドラッグ中の角("top_left"等)
+        self._resize_anchor = QPoint(0, 0)  # リサイズ中、固定したままにする対角の角の座標
         self._feeding_in_progress = False  # 餌やりモーション中の多重実行防止フラグ
         self._petting_in_progress = False  # なでるモーション中の多重実行防止フラグ
         self._current_expression: str | None = None  # 直前に表示した表情（再起動判定用）
+        self._current_image_path: Path | None = None  # 直前に表示した画像パス（スケール変更時の再描画用）
         self._normal_frame_index = 0
         self._normal_frame_direction = 1  # 往復(ピンポン)の進行方向: +1 or -1
         # モーション（餌やり/なでる）がアニメーションの一時停止・加速を制御している間は
@@ -92,6 +139,16 @@ class PetWindow(QWidget):
         layout.addWidget(self.label)
         layout.addWidget(self.button_bar)
 
+        # リサイズグリップ（四隅）はレイアウト管理外の子ウィジェットとして絶対配置する
+        # （他のウィジェットの上に重ねて表示するため、layoutには追加しない）
+        self._resize_grips = {
+            corner: _ResizeGrip(self, corner)
+            for corner in ("top_left", "top_right", "bottom_left", "bottom_right")
+        }
+        for grip in self._resize_grips.values():
+            grip.show()
+            grip.raise_()
+
         # 速度確認作業は完了したため非表示化（ロジック・スライダー自体は残す）
         self.anim_speed_panel.setVisible(False)
 
@@ -100,6 +157,93 @@ class PetWindow(QWidget):
 
         self.refresh_appearance()
         self.refresh_status_bars()
+        self._apply_scale(1.0)  # 各ウィジェットのサイズ・フォントを基準スケールで確定させる
+
+    # --- スケール管理 ---
+    def _pet_size(self) -> int:
+        """現在のスケールを反映したペット画像の表示サイズ(px)。"""
+        return int(PET_SIZE * self._scale)
+
+    def _button_size(self) -> int:
+        return int(BUTTON_SIZE * self._scale)
+
+    def _apply_scale(self, scale: float) -> None:
+        """スケール係数を確定し、ウィンドウ全体のサイズ・フォント・画像を再適用する。
+
+        MIN_SCALE〜MAX_SCALEにクランプしてから反映するため、呼び出し側は
+        範囲外の値を渡しても安全。
+        """
+        self._scale = max(MIN_SCALE, min(MAX_SCALE, scale))
+        pet_size = self._pet_size()
+        button_size = self._button_size()
+
+        self.label.setFixedSize(pet_size, pet_size)
+        if self._current_image_path is not None:
+            # 元画像から再スケールする（表示中のpixmapを再拡大すると多重縮小で劣化するため）
+            pixmap = QPixmap(str(self._current_image_path))
+            if not pixmap.isNull():
+                pixmap = pixmap.scaled(
+                    pet_size, pet_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+                self.label.setPixmap(pixmap)
+
+        for button in self._all_buttons:
+            button.setFixedSize(button_size, button_size)
+        button_font_px = max(8, int(16 * self._scale))
+        button_style = (
+            "QPushButton {"
+            " background-color: rgba(255, 255, 255, 160);"
+            f" border: none; border-radius: 6px; font-size: {button_font_px}px;"
+            "}"
+            "QPushButton:hover { background-color: rgba(255, 255, 255, 220); }"
+            "QPushButton:disabled { background-color: rgba(255, 255, 255, 60); }"
+        )
+        for button in self._all_buttons:
+            button.setStyleSheet(button_style)
+        # button_bar自体もstatus_panelと同じ理由で幅を明示的に固定する
+        # （中のボタンをsetFixedSizeで縮めただけではbutton_barのsizeHint
+        # キャッシュが追従せず、古い大きい幅のまま残ってしまう）
+        self.button_bar.setFixedWidth(pet_size)
+
+        gauge_height = max(4, int(8 * self._scale))
+        label_font_px = max(7, int(10 * self._scale))
+        label_width = max(16, int(28 * self._scale))
+        # status_panel自体の幅をpet_sizeに明示的に固定する。これが無いと、
+        # 中のQProgressBar/QLabelをsetFixedWidthで縮めても、status_panelの
+        # sizeHintキャッシュが縮小方向に追従せず、ウィンドウ全体の幅が
+        # ステータスパネルの古い（大きい）幅に引っ張られたままになる。
+        panel_h_margin = 6  # _build_status_barsのpanel_layout.setContentsMargins(6, 4, 6, 4)と合わせる
+        row_spacing = 4  # 各rowのsetSpacing(4)と合わせる
+        self.status_panel.setFixedWidth(pet_size)
+        gauge_width = max(20, pet_size - label_width - row_spacing - panel_h_margin * 2)
+        for bar in (self.hunger_bar, self.mood_bar, self.stamina_bar):
+            bar.setFixedWidth(gauge_width)
+            bar.setFixedHeight(gauge_height)
+        for text_label in self._status_text_labels:
+            text_label.setStyleSheet(f"color: white; font-size: {label_font_px}px;")
+            text_label.setFixedWidth(label_width)
+
+        # レイアウト管理下の子ウィジェットのサイズ変更をウィンドウ全体に反映させる。
+        # adjustSize()単体だと、一度大きくなったウィンドウが縮小方向にはうまく
+        # 追従しない（Qtのレイアウトキャッシュにより最小サイズが大きいまま残る）
+        # ことがあるため、制約を一旦解除してからレイアウトを再計算させる。
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)  # QWIDGETSIZE_MAX（実質無制限）
+        self.layout().invalidate()
+        self.layout().activate()
+        self.adjustSize()
+        # ウィンドウサイズが確定した後、リサイズグリップ（四隅）を追従させる
+        w, h = self.width(), self.height()
+        grip_positions = {
+            "top_left": (0, 0),
+            "top_right": (w - RESIZE_GRIP_SIZE, 0),
+            "bottom_left": (0, h - RESIZE_GRIP_SIZE),
+            "bottom_right": (w - RESIZE_GRIP_SIZE, h - RESIZE_GRIP_SIZE),
+        }
+        for corner, (gx, gy) in grip_positions.items():
+            grip = self._resize_grips[corner]
+            grip.move(gx, gy)
+            grip.raise_()
 
     # --- ステータスゲージの構築 ---
     def _build_status_bars(self) -> None:
@@ -115,6 +259,7 @@ class PetWindow(QWidget):
         self.hunger_bar = self._make_status_bar()
         self.mood_bar = self._make_status_bar()
         self.stamina_bar = self._make_status_bar()
+        self._status_text_labels: list[QLabel] = []  # _apply_scaleでフォント/幅を再適用するため保持
 
         for label_text, bar in (
             ("満腹", self.hunger_bar),
@@ -126,6 +271,7 @@ class PetWindow(QWidget):
             text_label = QLabel(label_text, self.status_panel)
             text_label.setStyleSheet("color: white; font-size: 10px;")
             text_label.setFixedWidth(28)
+            self._status_text_labels.append(text_label)
             row.addWidget(text_label)
             row.addWidget(bar)
             panel_layout.addLayout(row)
@@ -297,9 +443,11 @@ class PetWindow(QWidget):
     def _set_pixmap_from_path(self, image_path: Path) -> None:
         pixmap = QPixmap(str(image_path))
         if not pixmap.isNull():
+            self._current_image_path = image_path  # スケール変更時に元画像から再スケールするため記録
+            pet_size = self._pet_size()
             # KeepAspectRatio + SmoothTransformationでもアルファチャンネルは保持される
             pixmap = pixmap.scaled(
-                PET_SIZE, PET_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                pet_size, pet_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
             self.label.setPixmap(pixmap)
 
@@ -363,15 +511,18 @@ class PetWindow(QWidget):
             return
 
         # 口元あたり（画像中央よりやや下）を基準位置とする
-        mouth_x = self.label.x() + PET_SIZE // 2
-        mouth_y = self.label.y() + int(PET_SIZE * 0.6)
+        pet_size = self._pet_size()
+        mouth_x = self.label.x() + pet_size // 2
+        mouth_y = self.label.y() + int(pet_size * 0.6)
 
         # 餌アイコン（フェードイン→表示→フェードアウト）
+        icon_size = max(20, int(36 * self._scale))
+        icon_font_px = max(14, int(28 * self._scale))
         feed_icon = QLabel("🍖", self)
-        feed_icon.setStyleSheet("font-size: 28px;")
-        feed_icon.setFixedSize(36, 36)
+        feed_icon.setStyleSheet(f"font-size: {icon_font_px}px;")
+        feed_icon.setFixedSize(icon_size, icon_size)
         feed_icon.setAlignment(Qt.AlignCenter)
-        feed_icon.move(mouth_x - 18, mouth_y - 18)
+        feed_icon.move(mouth_x - icon_size // 2, mouth_y - icon_size // 2)
         opacity_effect = QGraphicsOpacityEffect(feed_icon)
         feed_icon.setGraphicsEffect(opacity_effect)
         feed_icon.show()
@@ -386,8 +537,13 @@ class PetWindow(QWidget):
         self._feed_icon_ref = feed_icon  # GC防止のため参照を保持
 
         # 食べかすパーティクル（口元中心に重ねて表示）
-        particle_widget = ParticleEffectWidget(self, make_crumb_config(), on_finished=lambda: None)
-        particle_widget.setGeometry(QRect(mouth_x - 40, mouth_y - 40, 80, 80))
+        particle_area = max(40, int(80 * self._scale))
+        particle_widget = ParticleEffectWidget(
+            self, make_crumb_config(self._scale), on_finished=lambda: None
+        )
+        particle_widget.setGeometry(
+            QRect(mouth_x - particle_area // 2, mouth_y - particle_area // 2, particle_area, particle_area)
+        )
         particle_widget.show()
 
         def on_motion_finished() -> None:
@@ -423,12 +579,18 @@ class PetWindow(QWidget):
         """
         self._resume_normal_animation(HAPPY_ANIM_INTERVAL_MS)
 
-        start_x = self.label.x() + PET_SIZE // 2 - 12
-        start_y = self.label.y() + 10
+        pet_size = self._pet_size()
+        heart_size = max(14, int(24 * self._scale))
+        heart_font_px = max(10, int(20 * self._scale))
+        drift = max(4, int(6 * self._scale))  # 左右の揺れ幅
+        rise = max(10, int(20 * self._scale))  # 1区間あたりの上昇量
+
+        start_x = self.label.x() + pet_size // 2 - heart_size // 2
+        start_y = self.label.y() + int(10 * self._scale)
 
         heart = QLabel("❤️", self)
-        heart.setStyleSheet("font-size: 20px;")
-        heart.setFixedSize(24, 24)
+        heart.setStyleSheet(f"font-size: {heart_font_px}px;")
+        heart.setFixedSize(heart_size, heart_size)
         heart.move(start_x, start_y)
         opacity_effect = QGraphicsOpacityEffect(heart)
         heart.setGraphicsEffect(opacity_effect)
@@ -438,9 +600,9 @@ class PetWindow(QWidget):
         pos_anim = QPropertyAnimation(heart, b"pos", self)
         pos_anim.setDuration(HEART_DURATION_MS)
         pos_anim.setKeyValueAt(0.0, QPoint(start_x, start_y))
-        pos_anim.setKeyValueAt(0.33, QPoint(start_x - 6, start_y - 20))
-        pos_anim.setKeyValueAt(0.66, QPoint(start_x + 6, start_y - 40))
-        pos_anim.setKeyValueAt(1.0, QPoint(start_x, start_y - 60))
+        pos_anim.setKeyValueAt(0.33, QPoint(start_x - drift, start_y - rise))
+        pos_anim.setKeyValueAt(0.66, QPoint(start_x + drift, start_y - rise * 2))
+        pos_anim.setKeyValueAt(1.0, QPoint(start_x, start_y - rise * 3))
         pos_anim.setEasingCurve(QEasingCurve.InOutSine)
 
         opacity_anim = QPropertyAnimation(opacity_effect, b"opacity", self)
@@ -465,12 +627,15 @@ class PetWindow(QWidget):
 
         on_completはシェイク終了時に呼ばれる。
         """
-        center_x = self.label.x() + PET_SIZE // 2 - 14
-        top_y = self.label.y() - 4
+        pet_size = self._pet_size()
+        icon_size = max(18, int(28 * self._scale))
+        icon_font_px = max(12, int(24 * self._scale))
+        center_x = self.label.x() + pet_size // 2 - icon_size // 2
+        top_y = self.label.y() - max(2, int(4 * self._scale))
 
         annoyed_icon = QLabel("💢", self)
-        annoyed_icon.setStyleSheet("font-size: 24px;")
-        annoyed_icon.setFixedSize(28, 28)
+        annoyed_icon.setStyleSheet(f"font-size: {icon_font_px}px;")
+        annoyed_icon.setFixedSize(icon_size, icon_size)
         annoyed_icon.move(center_x, top_y)
         annoyed_icon.show()
         self._annoyed_icon_ref = annoyed_icon  # GC防止
@@ -479,7 +644,7 @@ class PetWindow(QWidget):
         # labelはQVBoxLayout管理下にあるため、QPropertyAnimationでposを直接動かすと
         # レイアウト再計算時に競合するおそれがある。そのためQTimerで手動に
         # インデント(左マージン)を切り替え、見た目上の左右シェイクを表現する。
-        offsets = [-8, 8, -6, 6, -3, 3, 0]
+        offsets = [int(v * self._scale) for v in (-8, 8, -6, 6, -3, 3, 0)]  # 振幅をスケールに比例させる
         step_ms = max(1, SHAKE_DURATION_MS // len(offsets))
 
         def shake_step(index: int = 0) -> None:
@@ -522,7 +687,7 @@ class PetWindow(QWidget):
         # labelはQVBoxLayout管理下のため、posを直接動かすとレイアウト再計算と
         # 競合するおそれがある（あげすぎシェイクと同じ理由）。
         # そのためcontentsMarginsの上下を切り替えて見た目上の上下バウンドを表現する。
-        offsets = [-10, -16, -8, -2, 0]
+        offsets = [int(v * self._scale) for v in (-10, -16, -8, -2, 0)]  # 振幅をスケールに比例させる
         step_ms = max(1, PET_BOUNCE_DURATION_MS // len(offsets))
 
         def bounce_step(index: int = 0) -> None:
@@ -541,11 +706,71 @@ class PetWindow(QWidget):
         bounce_step()
 
         # キラキラパーティクル（画像中央を起点に周囲へ浮かび上がらせる）
-        center_x = self.label.x() + PET_SIZE // 2
-        center_y = self.label.y() + PET_SIZE // 2
-        sparkle_widget = ParticleEffectWidget(self, make_sparkle_config(), on_finished=lambda: None)
-        sparkle_widget.setGeometry(QRect(center_x - 60, center_y - 60, 120, 120))
+        pet_size = self._pet_size()
+        center_x = self.label.x() + pet_size // 2
+        center_y = self.label.y() + pet_size // 2
+        sparkle_area = max(60, int(120 * self._scale))
+        sparkle_widget = ParticleEffectWidget(
+            self, make_sparkle_config(self._scale), on_finished=lambda: None
+        )
+        sparkle_widget.setGeometry(
+            QRect(center_x - sparkle_area // 2, center_y - sparkle_area // 2, sparkle_area, sparkle_area)
+        )
         sparkle_widget.show()
+
+    # --- リサイズ処理（_ResizeGripから呼ばれる） ---
+    def begin_resize(self, global_pos: QPoint, corner: str) -> None:
+        self._resizing = True
+        self._resize_start_pos = global_pos
+        self._resize_start_scale = self._scale
+        self._resize_corner = corner
+        # ドラッグする角と対角にあたる「固定点」の画面座標を記録する。
+        # リサイズ中はこの点が画面上で動かないよう、サイズ変化に合わせて
+        # ウィンドウ位置を調整する（例: 左上角をドラッグする場合は右下を固定する）。
+        geo = self.geometry()
+        anchor_by_corner = {
+            "bottom_right": geo.topLeft(),
+            "top_left": geo.bottomRight(),
+            "top_right": geo.bottomLeft(),
+            "bottom_left": geo.topRight(),
+        }
+        self._resize_anchor = anchor_by_corner[corner]
+
+    def update_resize(self, global_pos: QPoint) -> None:
+        if not self._resizing or self._resize_start_pos is None or self._resize_corner is None:
+            return
+        delta = global_pos - self._resize_start_pos
+        # 角によって「外側に広げる」ドラッグ方向が異なるため、
+        # 左上系の角では符号を反転してから拡大/縮小量を揃える。
+        sign_x = 1 if self._resize_corner in ("bottom_right", "top_right") else -1
+        sign_y = 1 if self._resize_corner in ("bottom_right", "bottom_left") else -1
+        dx = delta.x() * sign_x
+        dy = delta.y() * sign_y
+        # 対角線方向のドラッグ量が大きい方の軸を基準にスケールを決める
+        # （アスペクト比を保つため、幅・高さに同じ係数を掛ける）
+        diff = dx if abs(dx) >= abs(dy) else dy
+        scale_delta = diff / PET_SIZE
+        self._apply_scale(self._resize_start_scale + scale_delta)
+        self._reposition_after_resize()
+
+    def _reposition_after_resize(self) -> None:
+        """リサイズ中、ドラッグしていない対角の角が画面上で固定されるようウィンドウ位置を調整する。"""
+        w, h = self.width(), self.height()
+        anchor = self._resize_anchor
+        if self._resize_corner == "bottom_right":
+            new_pos = anchor  # 左上が固定点そのものなので位置は変わらない
+        elif self._resize_corner == "top_left":
+            new_pos = QPoint(anchor.x() - w, anchor.y() - h)
+        elif self._resize_corner == "top_right":
+            new_pos = QPoint(anchor.x(), anchor.y() - h)
+        else:  # bottom_left
+            new_pos = QPoint(anchor.x() - w, anchor.y())
+        self.move(new_pos)
+
+    def end_resize(self) -> None:
+        self._resizing = False
+        self._resize_start_pos = None
+        self._resize_corner = None
 
     # --- マウス操作: クリックでなでる / ドラッグで移動 ---
     def mousePressEvent(self, event: QMouseEvent) -> None:
