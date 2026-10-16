@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import ctypes
 from pathlib import Path
 from typing import Callable
 
@@ -19,10 +20,11 @@ from PySide6.QtCore import (
     QPoint,
     QPropertyAnimation,
     QRect,
+    QSize,
     Qt,
     QTimer,
 )
-from PySide6.QtGui import QColor, QCursor, QMouseEvent, QPainter, QPaintEvent, QPen, QPixmap, QShowEvent
+from PySide6.QtGui import QColor, QCursor, QIcon, QMouseEvent, QPainter, QPaintEvent, QPen, QPixmap, QShowEvent
 from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHBoxLayout,
@@ -30,6 +32,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -42,8 +45,41 @@ ASSETS_DIR = Path(__file__).parent / "assets" / "pet"
 NORMAL_ANIM_DIR = ASSETS_DIR / "normal"
 NORMAL_ANIM_FRAMES = ["normal_flame1.png", "normal_flame2.png", "normal_flame3.png"]
 NORMAL_ANIM_INTERVAL_MS = 400  # フレーム切り替え間隔(ms)
+ANGRY_ANIM_DIR = ASSETS_DIR / "angry"
+ANGRY_ANIM_FRAMES = ["angry_flame1.png", "angry_flame2.png"]
+HUNGRY_ANIM_DIR = ASSETS_DIR / "hungry"
+HUNGRY_ANIM_FRAMES = ["hungry_flame1.png", "hungry_flame2.png"]
+# 表情ごとの往復アニメーションフレーム一覧（この辞書に無い表情は静止画のまま）
+EXPRESSION_ANIM_FRAMES: dict[str, tuple[Path, list[str]]] = {
+    "normal": (NORMAL_ANIM_DIR, NORMAL_ANIM_FRAMES),
+    "angry": (ANGRY_ANIM_DIR, ANGRY_ANIM_FRAMES),
+    "hungry": (HUNGRY_ANIM_DIR, HUNGRY_ANIM_FRAMES),
+}
+ANGRY_EFFECT_ICON = "💢"
+# 怒りエフェクトのタイミング(ms): 左下表示→(A)後に右上も追加表示(左下は残る)
+# →(B)後に左下だけ消える→(C)後に右上も消えて休止→(D)後に最初から繰り返す
+ANGRY_EFFECT_TOP_RIGHT_DELAY_MS = 300  # 左下表示から右上が追加表示されるまで
+ANGRY_EFFECT_BOTTOM_LEFT_HIDE_MS = 400  # 右上追加表示から左下が消えるまで
+ANGRY_EFFECT_TOP_RIGHT_HIDE_MS = 400  # 左下消滅から右上が消えるまで
+ANGRY_EFFECT_PAUSE_MS = 700  # 右上消滅から休止している時間（次サイクルまで）
 PET_SIZE = 200  # 表示サイズ（元画像は512x512なので縮小表示）
 BUTTON_SIZE = 36  # ボタン列の1つあたりのサイズ(px)
+
+# Win32 SetWindowPos用の定数。
+# QtのWindowStaysOnBottomHintだけでは「他ウィンドウクリック時に最背面が崩れる」
+# ため、user32.dllを直接叩いてOSレベルでZ-orderを固定する（Windows専用）。
+_HWND_TOPMOST = -1
+_HWND_BOTTOM = 1
+_SWP_NOMOVE = 0x0002
+_SWP_NOSIZE = 0x0001
+_SWP_NOACTIVATE = 0x0010
+
+
+def _set_window_z_order(hwnd: int, insert_after: int) -> None:
+    """指定したHWNDをinsert_after(HWND_TOPMOST/HWND_BOTTOM)の位置に固定する。"""
+    ctypes.windll.user32.SetWindowPos(
+        hwnd, insert_after, 0, 0, 0, 0, _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE
+    )
 
 FEED_ICON_DURATION_MS = 1000  # 餌アイコンのフェードイン→表示→フェードアウトの合計時間
 HEART_DURATION_MS = 2600  # 完食ハート演出の時間（確認しやすいよう通常の2倍に設定）
@@ -62,6 +98,88 @@ RESIZE_GRIP_SIZE = 32  # 角のリサイズグリップのサイズ(px、ウィ�
 
 MENU_TOGGLE_SIZE = 24  # メニュートグルボタンのサイズ(px、スケール不問の固定値)
 MENU_ANIM_DURATION_MS = 240  # メニュー開閉アニメーションの時間(ms)
+
+
+def _make_scaling_icon(size: int) -> QIcon:
+    """「拡大縮小」を連想させるアイコンを描画して生成する（grip_design_toggle_button用）。
+
+    左上⇔右下の対角線上に、外向きの矢印が付いた四角い枠を描く
+    （ウィンドウの角をドラッグしてリサイズする操作を直感的に示す）。
+    """
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+
+    margin = max(2, int(size * 0.2))
+    pen = QPen(Qt.white)
+    pen.setWidth(max(1, int(size * 0.08)))
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+
+    # 対角線上の小さい四角(左上寄り)と大きい四角(右下寄り)で「拡大」を表現
+    small = max(3, int(size * 0.26))
+    large = max(5, int(size * 0.42))
+    painter.drawRect(margin, margin, small, small)
+    painter.drawRect(size - margin - large, size - margin - large, large, large)
+
+    # 対角線を貫く矢印で両方向への拡大縮小を示す
+    arrow_start_x = margin + small + 1
+    arrow_start_y = margin + small + 1
+    arrow_end_x = size - margin - large - 1
+    arrow_end_y = size - margin - large - 1
+    painter.drawLine(arrow_start_x, arrow_start_y, arrow_end_x, arrow_end_y)
+
+    painter.end()
+    return QIcon(pixmap)
+
+
+DRAG_START_THRESHOLD_PX = 6  # この距離以上動いたら「クリック」ではなく「並び替えドラッグ」とみなす
+
+
+class _DraggableToggleButton(QPushButton):
+    """右下に縦積みされるトグルボタン。ドラッグ&ドロップで並び順を入れ替えられる。
+
+    通常のクリック操作と、並び替えのためのドラッグ操作を同じマウスボタンで
+    区別する必要があるため、「press後にDRAG_START_THRESHOLD_PX以上動いたら
+    ドラッグ」「動かずreleaseしたらクリック」という閾値判定を自前で行う
+    （QPushButton標準のclickedシグナルは、ドラッグ中に誤って発火しないよう
+    ドラッグが確定した時点でブロックする）。
+    """
+
+    def __init__(self, button_id: str, window: "PetWindow", parent: QWidget) -> None:
+        super().__init__(parent)
+        self.button_id = button_id
+        self._window = window
+        self._press_pos: QPoint | None = None
+        self._dragging = False
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.globalPosition().toPoint()
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._press_pos is not None and event.buttons() & Qt.LeftButton:
+            delta = event.globalPosition().toPoint() - self._press_pos
+            if not self._dragging and delta.manhattanLength() >= DRAG_START_THRESHOLD_PX:
+                self._dragging = True
+                self._window.begin_toggle_button_drag(self.button_id)
+            if self._dragging:
+                self._window.update_toggle_button_drag(event.globalPosition().toPoint())
+                return  # ドラッグ中はQPushButtonのhover等の既定動作を抑止する
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        was_dragging = self._dragging
+        self._press_pos = None
+        self._dragging = False
+        if was_dragging:
+            self._window.end_toggle_button_drag()
+            return  # ドラッグ確定時はclickedを発火させない（意図しない押下を防ぐ）
+        super().mouseReleaseEvent(event)
 
 
 class _ResizeGrip(QWidget):
@@ -164,6 +282,10 @@ class PetWindow(QWidget):
         self._current_image_path: Path | None = None  # 直前に表示した画像パス（スケール変更時の再描画用）
         self._normal_frame_index = 0
         self._normal_frame_direction = 1  # 往復(ピンポン)の進行方向: +1 or -1
+        self._angry_bottom_left_ref: QLabel | None = None  # 表示中の左下怒りアイコン（GC防止）
+        self._angry_top_right_ref: QLabel | None = None  # 表示中の右上怒りアイコン（GC防止）
+        self._angry_effect_active = False  # 怒りエフェクトのサイクルが進行中かどうか（stop時の多重singleShot防止）
+        self._always_on_top = True  # ウィンドウの最前面固定状態（トグルボタンで切り替え）
         # モーション（餌やり/なでる）がアニメーションの一時停止・加速を制御している間は
         # refresh_appearance側の表情変化によるタイマー起動/停止を無視する。
         # これにより「カス散布中に満腹度が変わって表情が切り替わる」等のケースでも
@@ -193,12 +315,38 @@ class PetWindow(QWidget):
         self._normal_anim_timer.setInterval(NORMAL_ANIM_INTERVAL_MS)
         self._normal_anim_timer.timeout.connect(self._advance_normal_frame)
 
+        # 最背面固定モードの間、定期的にSetWindowPos(HWND_BOTTOM)を送り直して
+        # Z-orderを維持する（Windowsの仕様上、最背面は一回限りの指示のため）
+        self._keep_bottom_timer = QTimer(self)
+        self._keep_bottom_timer.setInterval(500)
+        self._keep_bottom_timer.timeout.connect(self._reassert_bottom_z_order)
+
         self._build_status_bars()
         self._build_anim_speed_panel()
         self._build_button_bar()
+        self._build_quit_toggle_button()
         self._build_menu_toggle_button()
         self._build_status_toggle_button()
         self._build_grip_design_toggle_button()
+        self._build_always_on_top_toggle_button()
+        self._all_toggle_buttons = (
+            self.quit_toggle_button,
+            self.menu_toggle_button,
+            self.status_toggle_button,
+            self.grip_design_toggle_button,
+            self.always_on_top_toggle_button,
+        )
+        # ボタンID→ウィジェットの対応表。並び順はstate.toggle_button_orderが正であり、
+        # ここはIDから実体を引くためだけに使う（今後ボタンが増えてもここに1行
+        # 追加しDEFAULT_TOGGLE_BUTTON_ORDERに加えるだけで対応できる）。
+        self._toggle_button_by_id: dict[str, _DraggableToggleButton] = {
+            button.button_id: button for button in self._all_toggle_buttons
+        }
+        self._drag_button_id: str | None = None  # 現在ドラッグ中のボタンID（非ドラッグ中はNone）
+        self._drag_drop_index: int = -1  # ドラッグ中、現在カーソルが示している挿入先インデックス
+        self._drop_indicator = QWidget(self)  # ドラッグ中、挿入先を示す青い横線
+        self._drop_indicator.setStyleSheet("background-color: rgba(70, 150, 255, 230); border-radius: 1px;")
+        self._drop_indicator.hide()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -206,10 +354,18 @@ class PetWindow(QWidget):
         layout.addWidget(self.status_panel)
         layout.addWidget(self.anim_speed_panel)
         layout.addWidget(self.label)
-        layout.addWidget(self.button_bar)
+        # 末尾にstretchを入れないと、ウィンドウ高さを直接setGeometryで変更した際に
+        # QVBoxLayoutが余白の配分先を一意に決められず、maximumHeight=0で畳んでいる
+        # status_panel側にy座標のズレとして現れることがあった（高さ自体は0のまま）。
+        # stretchを「余白を受け止める専用の伸縮要素」として末尾に置くことで、
+        # 他の要素（label等）の位置を変えずに余白をここへ集約させる。
+        layout.addStretch(1)
+        # button_barは「☰アイコンの位置からぬるっと拡大して現れる」演出のため、
+        # レイアウト管理から外し絶対配置にする（geometryを自由にアニメーションさせるため）。
+        # 開閉中のウィンドウ全体の高さ拡張は_toggle_menu内で手動計算する。
 
-        # メニュー・ステータスパネルは初期状態で閉じておく（maximumHeight=0で高さ0に折りたたむ）
-        self.button_bar.setMaximumHeight(0)
+        # メニュー・ステータスパネルは初期状態で閉じておく（maximumHeight=0/非表示で畳む）
+        self.button_bar.hide()
         self.status_panel.setMaximumHeight(0)
 
         # リサイズグリップ（四隅）・トグルボタン類はレイアウト管理外の
@@ -225,18 +381,19 @@ class PetWindow(QWidget):
         for grip in self._resize_grips.values():
             grip.show()
             grip.raise_()
-        self.menu_toggle_button.show()
-        self.menu_toggle_button.raise_()
-        self.status_toggle_button.show()
-        self.status_toggle_button.raise_()
-        self.grip_design_toggle_button.show()
-        self.grip_design_toggle_button.raise_()
+        for toggle_button in self._all_toggle_buttons:
+            toggle_button.show()
+            toggle_button.raise_()
 
         # 速度確認作業は完了したため非表示化（ロジック・スライダー自体は残す）
         self.anim_speed_panel.setVisible(False)
 
         x, y = self.state.window_position
         self.move(x, y)
+
+        # 初期状態（常に最前面）をWin32レベルでも明示しておく
+        # （Qt標準フラグのみでも機能するが、最背面への切り替えとの対称性のため統一する）
+        _set_window_z_order(int(self.winId()), _HWND_TOPMOST)
 
         self.refresh_appearance()
         self.refresh_status_bars()
@@ -249,6 +406,15 @@ class PetWindow(QWidget):
 
     def _button_size(self) -> int:
         return int(BUTTON_SIZE * self._scale)
+
+    def _toggle_button_size(self) -> int:
+        """現在のスケールを反映したトグルボタン(☰📊/拡大縮小アイコン/📌)の表示サイズ(px)。
+
+        縮小時にボタン4段分の縦積みがウィンドウ高さを超えて見切れる不具合が
+        あったため、MENU_TOGGLE_SIZEを固定値ではなくスケール連動にした。
+        視認性・クリックしやすさを保つため最小14pxでクランプする。
+        """
+        return max(14, int(MENU_TOGGLE_SIZE * self._scale))
 
     def _apply_scale(self, scale: float) -> None:
         """スケール係数を確定し、ウィンドウ全体のサイズ・フォント・画像を再適用する。
@@ -281,6 +447,26 @@ class PetWindow(QWidget):
 
         for button in self._all_buttons:
             button.setFixedSize(button_size, button_size)
+
+        # トグルボタン(☰/📊/拡大縮小アイコン/📌)もスケールに追従させる。
+        # 固定サイズのままだと縮小時に4段の縦積みがウィンドウ高さを超えて
+        # 見切れてしまうため、_toggle_button_size()で算出したサイズに揃える。
+        toggle_size = self._toggle_button_size()
+        for toggle_button in self._all_toggle_buttons:
+            toggle_button.setFixedSize(toggle_size, toggle_size)
+        toggle_font_px = max(8, int(14 * self._scale))
+        for toggle_button in (
+            self.quit_toggle_button,
+            self.menu_toggle_button,
+            self.status_toggle_button,
+            self.always_on_top_toggle_button,
+        ):
+            style = toggle_button.styleSheet()
+            toggle_button.setStyleSheet(style.replace("font-size: 14px", f"font-size: {toggle_font_px}px"))
+        scaling_icon_size = max(8, int(toggle_size * 0.65))
+        self.grip_design_toggle_button.setIcon(_make_scaling_icon(scaling_icon_size))
+        self.grip_design_toggle_button.setIconSize(QSize(scaling_icon_size, scaling_icon_size))
+
         button_font_px = max(8, int(16 * self._scale))
         button_style = (
             "QPushButton {"
@@ -296,13 +482,10 @@ class PetWindow(QWidget):
         # （中のボタンをsetFixedSizeで縮めただけではbutton_barのsizeHint
         # キャッシュが追従せず、古い大きい幅のまま残ってしまう）
         self.button_bar.setFixedWidth(pet_size)
-        # 折りたたみメニューの高さはボタンサイズに応じて変わるため、
-        # 開いている時はスケールに応じた新しい高さに更新する。
-        # 閉じている時はmaximumHeight=0を維持し（折りたたみ状態を壊さない）、
-        # 「必要な高さ」だけを_menu_open_height()用に記録しておく。
+        # レイアウト外の絶対配置になったため、開いた時の実寸サイズ・位置は
+        # 自前で管理する。labelの位置はこの時点ではまだ確定していないため
+        # （resize()はこの後）、実際のgeometry再配置は本メソッド末尾で行う。
         self._button_bar_open_height = self.button_bar.sizeHint().height()
-        if self._menu_open:
-            self.button_bar.setMaximumHeight(self._button_bar_open_height)
 
         gauge_height = max(4, int(8 * self._scale))
         label_font_px = max(7, int(10 * self._scale))
@@ -341,6 +524,13 @@ class PetWindow(QWidget):
         # そのため、レイアウトのsizeHintから直接resize()してウィンドウサイズを
         # 確定させる（絶対配置の子ウィジェットの影響を受けない）。
         self.resize(self.layout().sizeHint())
+        if self._menu_open:
+            # button_barはレイアウト外のため、layout().sizeHint()にはその高さが
+            # 含まれない。メニューが開いたままリサイズされた場合は、ここで
+            # ウィンドウ高さにbutton_bar分を追加し、button_bar自体も
+            # labelの実位置を基準に（アニメーションなしで）再配置する。
+            self.resize(self.width(), self.height() + self._button_bar_open_height)
+            self.button_bar.setGeometry(self._button_bar_open_rect())
         # ウィンドウサイズが確定した後、グリップ・トグルボタン類を追従させる
         self._reposition_overlay_widgets()
 
@@ -351,6 +541,11 @@ class PetWindow(QWidget):
         self.status_panel.setStyleSheet(
             "background-color: rgba(0, 0, 0, 110); border-radius: 8px;"
         )
+        # sizePolicyを明示しないと、ウィンドウ高さを直接setGeometryで変更した際に
+        # QVBoxLayoutが余白をこのウィジェットの上下に配分してしまい、
+        # maximumHeight=0で畳んでいてもy座標がシフトしてlabel位置がズレる
+        # （button_bar等、label位置を基準に絶対配置する要素とのズレの原因になる）。
+        self.status_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         panel_layout = QVBoxLayout(self.status_panel)
         panel_layout.setContentsMargins(6, 4, 6, 4)
         panel_layout.setSpacing(2)
@@ -413,6 +608,9 @@ class PetWindow(QWidget):
         self.anim_speed_panel.setStyleSheet(
             "background-color: rgba(0, 0, 0, 110); border-radius: 8px;"
         )
+        # status_panelと同じ理由でFixedにする（setVisible(False)でも
+        # レイアウトの余白配分計算自体には影響しないため明示が必要）。
+        self.anim_speed_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         panel_layout = QHBoxLayout(self.anim_speed_panel)
         panel_layout.setContentsMargins(6, 4, 6, 4)
         panel_layout.setSpacing(4)
@@ -474,26 +672,42 @@ class PetWindow(QWidget):
         self.time_button.setToolTip("時間操作")
         self.time_button.clicked.connect(self._on_time_clicked)
 
-        self.quit_button = QPushButton("❌", self.button_bar)
-        self.quit_button.setToolTip("終了")
-        self.quit_button.clicked.connect(self._on_quit_clicked)
-
         self._all_buttons = (
             self.feed_button,
             self.pet_button,
             self.time_button,
-            self.quit_button,
         )
         for button in self._all_buttons:
             button.setFixedSize(BUTTON_SIZE, BUTTON_SIZE)
             button.setStyleSheet(button_style)
             bar_layout.addWidget(button)
 
+    def _build_quit_toggle_button(self) -> None:
+        """常時表示する終了ボタン（❌）。縦積みスタックの一員として並び替え対象になる。
+
+        以前はアクションメニュー(button_bar)内にあったが、他のトグルボタンと
+        同じ「常時表示の縦積みスタック」にまとめてほしいとの要望で移設した。
+        """
+        self.quit_toggle_button = _DraggableToggleButton("quit", self, self)
+        self.quit_toggle_button.setText("❌")
+        self.quit_toggle_button.setToolTip("終了（ドラッグで並び替え可能）")
+        self.quit_toggle_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
+        self.quit_toggle_button.setStyleSheet(
+            "QPushButton {"
+            " background-color: rgba(60, 60, 60, 200);"
+            " border: 1.5px solid rgba(255, 255, 255, 220);"
+            " border-radius: 6px; font-size: 14px; color: white;"
+            "}"
+            "QPushButton:hover { background-color: rgba(90, 90, 90, 220); }"
+        )
+        self.quit_toggle_button.clicked.connect(self._on_quit_clicked)
+
     # --- メニュートグルボタンの構築・開閉制御 ---
     def _build_menu_toggle_button(self) -> None:
         """常時表示する小さな開閉ボタン（☰）。クリックでbutton_barの開閉をトグルする。"""
-        self.menu_toggle_button = QPushButton("☰", self)
-        self.menu_toggle_button.setToolTip("メニュー")
+        self.menu_toggle_button = _DraggableToggleButton("menu", self, self)
+        self.menu_toggle_button.setText("☰")
+        self.menu_toggle_button.setToolTip("メニュー（ドラッグで並び替え可能）")
         self.menu_toggle_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
         # 白い背景の上でも視認できるよう、枠線と影でアイコンの輪郭を強調する
         # （半透明の背景だけだと白背景のデスクトップにほぼ溶け込んでしまうため）
@@ -512,8 +726,9 @@ class PetWindow(QWidget):
 
         見た目はmenu_toggle_buttonと統一し、縦に積み上がる1つ目のボタンとして配置する。
         """
-        self.status_toggle_button = QPushButton("📊", self)
-        self.status_toggle_button.setToolTip("ステータス")
+        self.status_toggle_button = _DraggableToggleButton("status", self, self)
+        self.status_toggle_button.setText("📊")
+        self.status_toggle_button.setToolTip("ステータス（ドラッグで並び替え可能）")
         self.status_toggle_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
         self.status_toggle_button.setStyleSheet(
             "QPushButton {"
@@ -525,44 +740,19 @@ class PetWindow(QWidget):
         )
         self.status_toggle_button.clicked.connect(self._toggle_status_panel)
 
-    def _reposition_menu_toggle_button(self) -> None:
-        """メニュートグルボタンをペット画像(label)の右下隅を基準に配置する。
-
-        以前はウィンドウ全体の右下を基準にしていたため、メニュー開閉で
-        ウィンドウの高さが変わるとボタン列の位置まで降りてきてしまい、
-        さらにgeometryアニメーション中は再配置されず古い位置に取り残されていた。
-        labelの位置・サイズはメニュー開閉の影響を受けないため、これを基準にすれば
-        どちらの問題も解消する（アニメーション中も追従処理が不要になる）。
-        """
-        pet_right = self.label.x() + self.label.width()
-        pet_bottom = self.label.y() + self.label.height()
-        self.menu_toggle_button.move(
-            pet_right - MENU_TOGGLE_SIZE - 4, pet_bottom - MENU_TOGGLE_SIZE - 4
-        )
-        self.menu_toggle_button.raise_()
-
-    def _reposition_status_toggle_button(self) -> None:
-        """ステータストグルボタンをmenu_toggle_buttonの真上に縦積みで配置する。
-
-        今後ボタンが増える方針のため、右下を起点にy座標をMENU_TOGGLE_SIZE+4ずつ
-        積み上げていく想定（このボタンはmenu_toggle_buttonの1段上）。
-        """
-        pet_right = self.label.x() + self.label.width()
-        pet_bottom = self.label.y() + self.label.height()
-        self.status_toggle_button.move(
-            pet_right - MENU_TOGGLE_SIZE - 4,
-            pet_bottom - MENU_TOGGLE_SIZE - 4 - (MENU_TOGGLE_SIZE + 4),
-        )
-        self.status_toggle_button.raise_()
-
     def _build_grip_design_toggle_button(self) -> None:
-        """リサイズグリップのL字デザインの表示/非表示を切り替えるボタン（👁）。
+        """リサイズグリップのL字デザインの表示/非表示を切り替えるボタン（拡大縮小アイコン）。
 
         OFFにしてもリサイズ機能自体（クリック判定）は常に動作する。
         見た目はmenu_toggle_button/status_toggle_buttonと統一し、縦積みの3段目に置く。
+        絵文字の👁だと「拡大縮小の表示切り替え」であることが伝わりにくいため、
+        対角線上の矢印でスケーリングを直感的に示す自作アイコンを使う。
         """
-        self.grip_design_toggle_button = QPushButton("👁", self)
-        self.grip_design_toggle_button.setToolTip("リサイズハンドルの表示切り替え")
+        self.grip_design_toggle_button = _DraggableToggleButton("grip_design", self, self)
+        icon_size = int(MENU_TOGGLE_SIZE * 0.65)
+        self.grip_design_toggle_button.setIcon(_make_scaling_icon(icon_size))
+        self.grip_design_toggle_button.setIconSize(QSize(icon_size, icon_size))
+        self.grip_design_toggle_button.setToolTip("リサイズハンドルの表示切り替え（ドラッグで並び替え可能）")
         self.grip_design_toggle_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
         self.grip_design_toggle_button.setStyleSheet(
             "QPushButton {"
@@ -573,16 +763,6 @@ class PetWindow(QWidget):
             "QPushButton:hover { background-color: rgba(90, 90, 90, 220); }"
         )
         self.grip_design_toggle_button.clicked.connect(self._toggle_grip_design)
-
-    def _reposition_grip_design_toggle_button(self) -> None:
-        """グリップデザイン切り替えボタンをstatus_toggle_buttonのさらに1段上に配置する。"""
-        pet_right = self.label.x() + self.label.width()
-        pet_bottom = self.label.y() + self.label.height()
-        self.grip_design_toggle_button.move(
-            pet_right - MENU_TOGGLE_SIZE - 4,
-            pet_bottom - MENU_TOGGLE_SIZE - 4 - (MENU_TOGGLE_SIZE + 4) * 2,
-        )
-        self.grip_design_toggle_button.raise_()
 
     def _toggle_grip_design(self) -> None:
         """全リサイズグリップのL字デザイン表示/非表示を一括で切り替える。
@@ -604,6 +784,79 @@ class PetWindow(QWidget):
         grip.design_visible = self._grip_design_visible and not self._status_open
         grip.update()
 
+    def _build_always_on_top_toggle_button(self) -> None:
+        """常時最前面表示のON/OFFを切り替えるボタン（📌）。
+
+        見た目は他のトグルボタンと統一し、縦積みの4段目に置く。
+        """
+        self.always_on_top_toggle_button = _DraggableToggleButton("always_on_top", self, self)
+        self.always_on_top_toggle_button.setText("📌")
+        self.always_on_top_toggle_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
+        self.always_on_top_toggle_button.clicked.connect(self._toggle_always_on_top)
+        self._update_always_on_top_button_style()
+
+    def _update_always_on_top_button_style(self) -> None:
+        """最前面/最背面の現在状態に応じてボタンの見た目（色・ツールチップ）を切り替える。
+
+        状態が一見して分かるよう、最前面=目立つ青系、最背面=通常のグレーにする。
+        """
+        if self._always_on_top:
+            self.always_on_top_toggle_button.setToolTip(
+                "常に最前面に表示中（クリックで最背面へ、ドラッグで並び替え可能）"
+            )
+            self.always_on_top_toggle_button.setStyleSheet(
+                "QPushButton {"
+                " background-color: rgba(40, 110, 220, 220);"
+                " border: 1.5px solid rgba(255, 255, 255, 220);"
+                " border-radius: 6px; font-size: 14px; color: white;"
+                "}"
+                "QPushButton:hover { background-color: rgba(60, 130, 240, 240); }"
+            )
+        else:
+            self.always_on_top_toggle_button.setToolTip(
+                "常に最背面に表示中（クリックで最前面へ、ドラッグで並び替え可能）"
+            )
+            self.always_on_top_toggle_button.setStyleSheet(
+                "QPushButton {"
+                " background-color: rgba(60, 60, 60, 200);"
+                " border: 1.5px solid rgba(255, 255, 255, 220);"
+                " border-radius: 6px; font-size: 14px; color: white;"
+                "}"
+                "QPushButton:hover { background-color: rgba(90, 90, 90, 220); }"
+            )
+
+    def _toggle_always_on_top(self) -> None:
+        """常時最前面表示/常時最背面表示を切り替える。
+
+        最前面側はQtのWindowStaysOnTopHint（Win32のHWND_TOPMOST相当）で、
+        他ウィンドウをクリックされても崩れない持続的な固定として機能する。
+        一方、HWND_BOTTOMによる最背面は一回限りの「今だけ一番後ろ」という
+        指示でしかなく、Windowsの仕様上は他ウィンドウがアクティブになる
+        たびに前後関係が崩れる。これを「常に最背面」として維持するため、
+        最背面モードの間はQTimerで定期的にSetWindowPos(HWND_BOTTOM)を
+        送り直し続ける（_keep_bottom_timerで制御）。
+        """
+        self._always_on_top = not self._always_on_top
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, self._always_on_top)
+        self.show()
+        self._update_always_on_top_button_style()
+
+        hwnd = int(self.winId())
+        if self._always_on_top:
+            self._keep_bottom_timer.stop()
+            _set_window_z_order(hwnd, _HWND_TOPMOST)
+        else:
+            _set_window_z_order(hwnd, _HWND_BOTTOM)
+            self._keep_bottom_timer.start()
+
+        self._raise_resize_grips()
+        for toggle_button in self._all_toggle_buttons:
+            toggle_button.raise_()
+
+    def _reassert_bottom_z_order(self) -> None:
+        """最背面モード中、定期的にウィンドウを最背面へ送り直す（_keep_bottom_timer用）。"""
+        _set_window_z_order(int(self.winId()), _HWND_BOTTOM)
+
     def _raise_resize_grips(self) -> None:
         """リサイズグリップを最前面に上げ直す。
 
@@ -614,52 +867,117 @@ class PetWindow(QWidget):
         for grip in self._resize_grips.values():
             grip.raise_()
 
+    def _button_bar_open_rect(self) -> QRect:
+        """button_barが開いた状態で占める、ウィンドウ座標系での矩形（ペット画像の直下）。"""
+        pet_size = self._pet_size()
+        return QRect(
+            self.label.x(), self.label.y() + self.label.height() + 4,
+            pet_size, self._button_bar_open_height,
+        )
+
+    def _close_menu_immediately(self) -> None:
+        """アニメーションなしでメニューを即座に閉じる（リサイズ開始時に使う）。
+
+        進行中の開閉アニメーションがあれば打ち切り、button_barを隠して
+        ウィンドウ高さも開いていた分だけ即座に縮める。
+        """
+        if self._menu_animation_group is not None:
+            self._menu_animation_group.stop()
+            self._menu_animation_group = None
+        if not self._menu_open:
+            return
+        self._menu_open = False
+        current_geo = self.geometry()
+        self.setGeometry(
+            current_geo.x(), current_geo.y(),
+            current_geo.width(), current_geo.height() - self.button_bar.height(),
+        )
+        self.button_bar.hide()
+        if self.button_bar.graphicsEffect() is not None:
+            self.button_bar.graphicsEffect().setOpacity(0.0)
+
     def _toggle_menu(self) -> None:
         """button_barの開閉状態をアニメーション付きで切り替える。
 
-        開閉中にbutton_barの高さとウィンドウ全体の高さを同時にアニメーションさせるため、
-        QParallelAnimationGroupで2本のQPropertyAnimationを束ねて実行する。
+        「☰アイコンの位置から小さく現れて実寸へぬるっと広がる」演出のため、
+        button_barはレイアウト外の絶対配置にしてあり、geometry（位置＋サイズ）を
+        直接アニメーションさせる。閉じた状態の矩形は常にmenu_toggle_buttonの
+        現在位置・サイズを基準にする（ドラッグ&ドロップで☰の段位置が変わっても
+        常にそこから出入りするように見せるため）。中のボタンは広がりに合わせて
+        不透明度をフェードイン/アウトさせ、縮んだ状態でボタンの形が潰れて
+        見えることを隠す。
+
+        ウィンドウ全体の高さは、button_bar自体のgeometryアニメーションとは
+        切り離し、開く時は先に最終サイズへ即時確定する（QVBoxLayoutが
+        ウィンドウサイズ変更のたびにlabel位置を再計算し、アニメーション中に
+        open_rectの基準がずれてしまう問題を避けるため）。透過ウィンドウなので
+        button_barが小さい間、周囲は透明のままで見た目には影響しない。
         """
         self._raise_resize_grips()
         self._menu_open = not self._menu_open
-        target_bar_height = self._button_bar_open_height if self._menu_open else 0
 
+        closed_rect = QRect(self.menu_toggle_button.pos(), self.menu_toggle_button.size())
+        start_rect = self.button_bar.geometry() if self.button_bar.isVisible() else closed_rect
+
+        # button_barはlabel下端から4pxのマージンを空けて配置されるため、
+        # ウィンドウの拡張量にもその分を含める（含めないとbutton_barの下端が
+        # ウィンドウ高さをわずかに超えてはみ出す）。
         current_geo = self.geometry()
-        height_diff = target_bar_height - self.button_bar.maximumHeight()
-        target_geo = QRect(current_geo.x(), current_geo.y(), current_geo.width(), current_geo.height() + height_diff)
+        target_bar_height = self._button_bar_open_height + 4 if self._menu_open else 0
+        current_bar_height = self.button_bar.height() + 4 if self.button_bar.isVisible() else 0
+        height_diff = target_bar_height - current_bar_height
+        target_geo = QRect(
+            current_geo.x(), current_geo.y(), current_geo.width(), current_geo.height() + height_diff
+        )
 
-        # 既存のアニメーションが進行中なら打ち切ってから新しいものを開始する
-        # （連打された場合に古いアニメーションの終了処理と競合しないようにする）
         if self._menu_animation_group is not None:
             self._menu_animation_group.stop()
 
-        bar_anim = QPropertyAnimation(self.button_bar, b"maximumHeight", self)
-        bar_anim.setDuration(MENU_ANIM_DURATION_MS)
-        bar_anim.setStartValue(self.button_bar.maximumHeight())
-        bar_anim.setEndValue(target_bar_height)
-        bar_anim.setEasingCurve(QEasingCurve.InOutCubic)
+        if self._menu_open:
+            # 開く場合: 先にウィンドウを最終サイズへ確定してからlabel位置を
+            # 再計算し、その位置を基準にend_rect(open_rect)を求める
+            self.setGeometry(target_geo)
+            end_rect = self._button_bar_open_rect()
+        else:
+            end_rect = closed_rect
 
-        geo_anim = QPropertyAnimation(self, b"geometry", self)
+        if self.button_bar.graphicsEffect() is None:
+            self._button_bar_opacity_effect = QGraphicsOpacityEffect(self.button_bar)
+            self.button_bar.setGraphicsEffect(self._button_bar_opacity_effect)
+        opacity_effect = self.button_bar.graphicsEffect()
+
+        self.button_bar.setGeometry(start_rect)
+        self.button_bar.show()
+        self.button_bar.raise_()
+
+        geo_anim = QPropertyAnimation(self.button_bar, b"geometry", self)
         geo_anim.setDuration(MENU_ANIM_DURATION_MS)
-        geo_anim.setStartValue(current_geo)
-        geo_anim.setEndValue(target_geo)
-        geo_anim.setEasingCurve(QEasingCurve.InOutCubic)
+        geo_anim.setStartValue(start_rect)
+        geo_anim.setEndValue(end_rect)
+        geo_anim.setEasingCurve(QEasingCurve.OutCubic if self._menu_open else QEasingCurve.InCubic)
+
+        opacity_anim = QPropertyAnimation(opacity_effect, b"opacity", self)
+        opacity_anim.setDuration(MENU_ANIM_DURATION_MS)
+        opacity_anim.setStartValue(opacity_effect.opacity())
+        opacity_anim.setEndValue(1.0 if self._menu_open else 0.0)
+        opacity_anim.setEasingCurve(QEasingCurve.OutCubic if self._menu_open else QEasingCurve.InCubic)
 
         group = QParallelAnimationGroup(self)
-        group.addAnimation(bar_anim)
         group.addAnimation(geo_anim)
+        group.addAnimation(opacity_anim)
+        # 閉じる場合のみ、アニメーション完了後にウィンドウを縮小する
+        # （開く場合は既に上でsetGeometry済みなのでtarget_geoの再適用は不要）
+        if not self._menu_open:
+            group.finished.connect(lambda: self.setGeometry(target_geo))
         group.finished.connect(self._on_menu_animation_finished)
         self._menu_animation_group = group
         group.start()
 
     def _on_menu_animation_finished(self) -> None:
-        """メニュー開閉アニメーション終了時、サイズ制約の後始末とグリップ再配置を行う。
-
-        geometryアニメーション中はsetMaximumSizeの制約を外していないため、
-        adjustSize()は使わずジオメトリをそのまま確定値とする。グリップ・
-        トグルボタンの位置だけ最新のウィンドウサイズに追従させる。
-        """
+        """メニュー開閉アニメーション終了時、後始末とグリップ再配置を行う。"""
         self._menu_animation_group = None
+        if not self._menu_open:
+            self.button_bar.hide()
         self._reposition_overlay_widgets()
 
     def _toggle_status_panel(self) -> None:
@@ -750,10 +1068,11 @@ class PetWindow(QWidget):
             return
         self._current_expression = expression
 
-        if expression == "normal":
+        if expression in EXPRESSION_ANIM_FRAMES:
+            anim_dir, anim_frames = EXPRESSION_ANIM_FRAMES[expression]
             self._normal_frame_index = 0
             self._normal_frame_direction = 1
-            self._set_pixmap_from_path(NORMAL_ANIM_DIR / NORMAL_ANIM_FRAMES[0])
+            self._set_pixmap_from_path(anim_dir / anim_frames[0])
             # モーション側が一時停止/加速を制御している間は、ここでタイマーを
             # 起動しない（モーション終了時の意図したタイミングで再開させる）
             if not self._motion_controls_animation:
@@ -762,6 +1081,12 @@ class PetWindow(QWidget):
             if not self._motion_controls_animation:
                 self._normal_anim_timer.stop()
             self._set_pixmap_from_path(ASSETS_DIR / f"{expression}.png")
+
+        if expression == "angry":
+            self._start_angry_effect()
+        else:
+            self._stop_angry_effect()
+
         self.refresh_status_bars()
 
     def _set_pixmap_from_path(self, image_path: Path) -> None:
@@ -776,11 +1101,16 @@ class PetWindow(QWidget):
             self.label.setPixmap(pixmap)
 
     def _advance_normal_frame(self) -> None:
-        """通常状態の往復(ピンポン)アニメーションを1フレーム進める。
+        """現在の表情の往復(ピンポン)アニメーションを1フレーム進める。
 
         1→2→3→2→1→2→...のように端で折り返し、重複なく往復する。
+        normal/angryで共通のフレーム送りロジックを使う
+        （EXPRESSION_ANIM_FRAMESに表情ごとの画像フォルダ・フレーム一覧を定義）。
         """
-        last_index = len(NORMAL_ANIM_FRAMES) - 1
+        anim_dir, anim_frames = EXPRESSION_ANIM_FRAMES.get(
+            self._current_expression, (NORMAL_ANIM_DIR, NORMAL_ANIM_FRAMES)
+        )
+        last_index = len(anim_frames) - 1
         self._normal_frame_index += self._normal_frame_direction
         if self._normal_frame_index >= last_index:
             self._normal_frame_index = last_index
@@ -788,7 +1118,80 @@ class PetWindow(QWidget):
         elif self._normal_frame_index <= 0:
             self._normal_frame_index = 0
             self._normal_frame_direction = 1
-        self._set_pixmap_from_path(NORMAL_ANIM_DIR / NORMAL_ANIM_FRAMES[self._normal_frame_index])
+        self._set_pixmap_from_path(anim_dir / anim_frames[self._normal_frame_index])
+
+    # --- 怒りエフェクト（angry表情の間、ループ表示） ---
+    # サイクル: 左下表示 →(TOP_RIGHT_DELAY)→ 右上も追加表示(左下は残る)
+    # →(BOTTOM_LEFT_HIDE)→ 左下だけ消える →(TOP_RIGHT_HIDE)→ 右上も消えて休止
+    # →(PAUSE)→ 最初から繰り返す
+    def _start_angry_effect(self) -> None:
+        """怒りエフェクトのループを開始する（既に開始済みなら何もしない）。"""
+        if self._angry_effect_active:
+            return
+        self._angry_effect_active = True
+        self._angry_cycle_show_bottom_left()
+
+    def _stop_angry_effect(self) -> None:
+        """怒りエフェクトのループを止め、表示中のアイコンを消す。
+
+        _angry_effect_activeをFalseにすることで、進行中のsingleShotチェーンが
+        予約済みでも次のステップで自分自身を停止する（タイマーを直接キャンセル
+        する手段がQTimer.singleShotには無いため、フラグで止める方式にしている）。
+        """
+        self._angry_effect_active = False
+        if self._angry_bottom_left_ref is not None:
+            self._angry_bottom_left_ref.deleteLater()
+            self._angry_bottom_left_ref = None
+        if self._angry_top_right_ref is not None:
+            self._angry_top_right_ref.deleteLater()
+            self._angry_top_right_ref = None
+
+    def _make_angry_icon(self, *, top_right: bool) -> QLabel:
+        """怒りエフェクトの💢アイコンを1個生成して表示する（右上=中サイズ、左下=小サイズ）。"""
+        pet_size = self._pet_size()
+        icon_size = max(16, int((22 if top_right else 16) * self._scale))
+        icon_font_px = max(11, int((19 if top_right else 14) * self._scale))
+        if top_right:
+            x = self.label.x() + int(pet_size * 0.68)
+            y = self.label.y() + int(pet_size * 0.02)
+        else:
+            x = self.label.x() + int(pet_size * 0.28)
+            y = self.label.y() + int(pet_size * 0.50)
+
+        icon = QLabel(ANGRY_EFFECT_ICON, self)
+        icon.setStyleSheet(f"font-size: {icon_font_px}px;")
+        icon.setFixedSize(icon_size, icon_size)
+        icon.move(x, y)
+        icon.show()
+        return icon
+
+    def _angry_cycle_show_bottom_left(self) -> None:
+        if not self._angry_effect_active:
+            return
+        self._angry_bottom_left_ref = self._make_angry_icon(top_right=False)
+        QTimer.singleShot(ANGRY_EFFECT_TOP_RIGHT_DELAY_MS, self._angry_cycle_show_top_right)
+
+    def _angry_cycle_show_top_right(self) -> None:
+        if not self._angry_effect_active:
+            return
+        self._angry_top_right_ref = self._make_angry_icon(top_right=True)
+        QTimer.singleShot(ANGRY_EFFECT_BOTTOM_LEFT_HIDE_MS, self._angry_cycle_hide_bottom_left)
+
+    def _angry_cycle_hide_bottom_left(self) -> None:
+        if not self._angry_effect_active:
+            return
+        if self._angry_bottom_left_ref is not None:
+            self._angry_bottom_left_ref.deleteLater()
+            self._angry_bottom_left_ref = None
+        QTimer.singleShot(ANGRY_EFFECT_TOP_RIGHT_HIDE_MS, self._angry_cycle_hide_top_right)
+
+    def _angry_cycle_hide_top_right(self) -> None:
+        if not self._angry_effect_active:
+            return
+        if self._angry_top_right_ref is not None:
+            self._angry_top_right_ref.deleteLater()
+            self._angry_top_right_ref = None
+        QTimer.singleShot(ANGRY_EFFECT_PAUSE_MS, self._angry_cycle_show_bottom_left)
 
     # --- モーション中の立ち絵アニメーション制御（餌やり/なでる共通） ---
     def _pause_normal_animation(self) -> None:
@@ -808,7 +1211,7 @@ class PetWindow(QWidget):
         （スライダー自体を「基準速度」とみなす設計）。
         """
         self._motion_controls_animation = False
-        if self._current_expression == "normal":
+        if self._current_expression in EXPRESSION_ANIM_FRAMES:
             self._normal_anim_timer.setInterval(interval_ms)
             self._normal_anim_timer.start()
 
@@ -1044,6 +1447,12 @@ class PetWindow(QWidget):
 
     # --- リサイズ処理（_ResizeGripから呼ばれる） ---
     def begin_resize(self, global_pos: QPoint, corner: str) -> None:
+        # メニュー(button_bar)が開いたままリサイズすると、QVBoxLayoutの余白配分の
+        # 影響でlabel位置がズレ、button_barの絶対配置と整合が取れなくなる。
+        # そのため、リサイズ開始時にメニューが開いていれば即座に（アニメーション
+        # なしで）閉じる。
+        if self._menu_open:
+            self._close_menu_immediately()
         self._resizing = True
         self._resize_start_pos = global_pos
         self._resize_start_scale = self._scale
@@ -1105,9 +1514,110 @@ class PetWindow(QWidget):
             grip = self._resize_grips[corner]
             grip.move(gx, gy)
             grip.raise_()
-        self._reposition_menu_toggle_button()
-        self._reposition_status_toggle_button()
-        self._reposition_grip_design_toggle_button()
+        self._reposition_toggle_buttons()
+
+    def _reposition_toggle_buttons(self) -> None:
+        """state.toggle_button_orderの並び順に従い、トグルボタンを縦積みで配置する。
+
+        リスト先頭(index 0)が最下段（ペット画像に最も近い）、末尾が最上段になる。
+        ドラッグ中はドラッグ元のボタンだけ座標計算から除外する
+        （カーソル追従させるため、この後update_toggle_button_dragが別途動かす）。
+        """
+        size = self._toggle_button_size()
+        pet_right = self.label.x() + self.label.width()
+        pet_bottom = self.label.y() + self.label.height()
+        order = self.state.toggle_button_order
+        for index, button_id in enumerate(order):
+            button = self._toggle_button_by_id.get(button_id)
+            if button is None or button_id == self._drag_button_id:
+                continue
+            button.move(
+                pet_right - size - 4,
+                pet_bottom - size - 4 - (size + 4) * index,
+            )
+            button.raise_()
+
+    def _toggle_button_stack_rect_for_index(self, index: int) -> QRect:
+        """縦積みのindex段目が占めるウィンドウ内矩形を返す（ドロップ判定・インジケータ表示用）。"""
+        size = self._toggle_button_size()
+        pet_right = self.label.x() + self.label.width()
+        pet_bottom = self.label.y() + self.label.height()
+        y = pet_bottom - size - 4 - (size + 4) * index
+        return QRect(pet_right - size - 4, y, size, size)
+
+    def begin_toggle_button_drag(self, button_id: str) -> None:
+        """トグルボタンの並び替えドラッグを開始する（_DraggableToggleButtonから呼ばれる）。
+
+        ドラッグ元ボタンを半透明にして「つかんでいる」状態を視覚的に示し、
+        以後はupdate_toggle_button_dragがカーソルに追従させる。
+        """
+        self._drag_button_id = button_id
+        button = self._toggle_button_by_id[button_id]
+        opacity_effect = QGraphicsOpacityEffect(button)
+        opacity_effect.setOpacity(0.45)
+        button.setGraphicsEffect(opacity_effect)
+        button.raise_()
+        self._drop_indicator.setFixedSize(self._toggle_button_size(), 3)
+        self._drop_indicator.show()
+        self._drop_indicator.raise_()
+
+    def update_toggle_button_drag(self, global_pos: QPoint) -> None:
+        """ドラッグ中、カーソル位置にボタン本体を追従させ、挿入先インデックスを再計算する。"""
+        if self._drag_button_id is None:
+            return
+        button = self._toggle_button_by_id[self._drag_button_id]
+        size = self._toggle_button_size()
+        local_pos = self.mapFromGlobal(global_pos)
+        button.move(local_pos.x() - size // 2, local_pos.y() - size // 2)
+        button.raise_()
+
+        order = self.state.toggle_button_order
+        drop_index = self._compute_drop_index(local_pos.y(), order)
+        self._drag_drop_index = drop_index
+        indicator_rect = self._toggle_button_stack_rect_for_index(drop_index)
+        # 横線は段の下端（次の段との境目）に表示し、「ここに挟まる」ことを示す
+        self._drop_indicator.move(indicator_rect.x(), indicator_rect.y() - 2)
+        self._drop_indicator.raise_()
+
+    def _compute_drop_index(self, cursor_y: int, order: list[str]) -> int:
+        """カーソルのy座標から、最も近い段境界のインデックスを返す。
+
+        ドラッグ元自身を除いた並びの中で、各段の中心y座標とカーソルを比較し、
+        最も近い段の位置（0〜len(order)-1、ドラッグ元を除いた個数基準）を返す。
+        """
+        remaining = [bid for bid in order if bid != self._drag_button_id]
+        if not remaining:
+            return 0
+        size = self._toggle_button_size()
+        pet_bottom = self.label.y() + self.label.height()
+        best_index = 0
+        best_distance = None
+        for index in range(len(remaining)):
+            center_y = pet_bottom - size - 4 - (size + 4) * index + size // 2
+            distance = abs(cursor_y - center_y)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_index = index
+        return best_index
+
+    def end_toggle_button_drag(self) -> None:
+        """ドラッグを確定し、並び順を更新・保存して配置し直す。"""
+        if self._drag_button_id is None:
+            return
+        button_id = self._drag_button_id
+        drop_index = self._drag_drop_index
+        button = self._toggle_button_by_id[button_id]
+        button.setGraphicsEffect(None)
+        self._drop_indicator.hide()
+        self._drag_button_id = None
+        self._drag_drop_index = -1
+
+        order = [bid for bid in self.state.toggle_button_order if bid != button_id]
+        drop_index = max(0, min(drop_index, len(order)))
+        order.insert(drop_index, button_id)
+        self.state.toggle_button_order = order
+        self.state.save()
+        self._reposition_toggle_buttons()
 
     def end_resize(self) -> None:
         self._resizing = False

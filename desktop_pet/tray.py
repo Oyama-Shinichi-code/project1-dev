@@ -22,7 +22,7 @@ class PetTray(QSystemTrayIcon):
         controller: PetController,
         get_window_pos: Callable[[], tuple[int, int]],
     ) -> None:
-        icon_path = ASSETS_DIR / "normal.png"
+        icon_path = ASSETS_DIR / "normal" / "normal_flame1.png"
         super().__init__(QIcon(str(icon_path)))
         self.setToolTip("デスクトップペット")
 

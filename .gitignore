@@ -14,3 +14,6 @@ tools/generated_images/*
 # デスクトップペットのセーブデータ（プレイヤーごとの状態）はリポジトリに含めない
 desktop_pet/data/*
 !desktop_pet/data/.gitkeep
+
+# exe化のビルド成果物・中間ファイル（サイズが大きくバイナリのためリポジトリに含めない）
+dist_prototype/

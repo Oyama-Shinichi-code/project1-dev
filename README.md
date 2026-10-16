@@ -61,6 +61,22 @@ venvはプロジェクトルートの `.venv/` に作成してください（`.g
 
 ステータス（満腹度/機嫌/体力、ウィンドウ位置など）は `desktop_pet/data/pet_state.json` に自動保存されます（`.gitignore`で除外済み。ユーザーごとのプレイ状況のため）。
 
+## exe化（Windows用配布ファイルのビルド）
+
+Python環境が無い人でも実行できるよう、PyInstallerで単体のWindowsアプリ（exe + 同梱DLL一式）としてビルドできます。
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m PyInstaller --name DesktopPet --onedir --windowed --noconfirm `
+  --distpath dist_prototype --workpath dist_prototype/_build --specpath dist_prototype/_build `
+  --add-data "desktop_pet\assets;desktop_pet/assets" -p . desktop_pet\main.py
+```
+
+ビルドが成功すると `dist_prototype/DesktopPet/` 配下に `DesktopPet.exe` と `_internal/`（依存DLL・アセット一式）が生成されます。**このフォルダごと**配布してください（exeファイル単体では動きません）。`dist_prototype/_build/` は中間ファイル（`.spec`・`.toc`等）で、こちらに実行可能なexeは生成されません。**実行・配布には必ず `dist_prototype/DesktopPet/DesktopPet.exe` を使ってください。**
+
+- `dist_prototype/` は丸ごとビルド成果物・中間ファイル（数百MB規模のバイナリ）のため `.gitignore` で除外しています。配布する場合は `dist_prototype/DesktopPet/` フォルダをZIP圧縮するかGitHub Releases等、リポジトリ外の手段を使ってください。
+- セーブデータ（`pet_state.json`）はexeと同じ `_internal/desktop_pet/data/` 配下に作成されます。配布先の環境で管理者権限が必要な場所（`C:\Program Files\` 等）に置くと保存に失敗する可能性があるため、デスクトップなど書き込み可能な場所への配置を推奨します。
+
 ## 画像生成ツール（開発者向け）
 
 ペット用画像などを生成する場合は `tools/image_gen/generate_image.py`（Pollinations.ai利用、APIキー不要・無料）を使用します。生成された画像は `tools/generated_images/`（git管理外）に保存され、確定版は `desktop_pet/assets/pet/` 等へ手動で移動して使用します。
@@ -79,6 +95,7 @@ desktop_pet/        デスクトップペットアプリ本体
   data/                 セーブデータ（git管理外）
 tools/image_gen/     画像生成ツール
 requirements.txt     Python依存パッケージ
+dist_prototype/      exe化ビルド成果物・中間ファイル（git管理外。DesktopPet/が配布用、_build/が中間ファイル）
 ```
 
 ## 開発ルール

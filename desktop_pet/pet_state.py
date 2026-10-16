@@ -21,6 +21,7 @@ STATUS_MIN = 0
 STATUS_MAX = 100
 
 DEFAULT_DATA_PATH = Path(__file__).parent / "data" / "pet_state.json"
+DEFAULT_TOGGLE_BUTTON_ORDER = ["quit", "menu", "status", "grip_design", "always_on_top"]
 
 
 def _clamp(value: float) -> float:
@@ -41,6 +42,11 @@ class PetState:
     evolution_stage: str = "child"
     notifications_enabled: bool = True
     window_position: list[int] = field(default_factory=lambda: [1200, 650])
+    # 右下に縦積みされるトグルボタンの並び順（下から上の順）。
+    # ユーザーがドラッグ&ドロップで並び替えた結果を保存する。
+    toggle_button_order: list[str] = field(
+        default_factory=lambda: list(DEFAULT_TOGGLE_BUTTON_ORDER)
+    )
 
     # --- 現在時刻（仮想オフセット込み） ---
     def virtual_now(self) -> datetime:
@@ -113,6 +119,7 @@ class PetState:
             "settings": {
                 "notifications_enabled": self.notifications_enabled,
                 "window_position": self.window_position,
+                "toggle_button_order": self.toggle_button_order,
             },
         }
 
@@ -120,6 +127,14 @@ class PetState:
     def from_dict(cls, data: dict[str, Any]) -> "PetState":
         status = data.get("status", {})
         settings = data.get("settings", {})
+        toggle_button_order = settings.get("toggle_button_order")
+        # 保存データの要素が現行のボタンID集合と完全一致しない場合
+        # （手編集での破損、将来のボタン増減など）はデフォルト順にフォールバックする
+        if (
+            not isinstance(toggle_button_order, list)
+            or set(toggle_button_order) != set(DEFAULT_TOGGLE_BUTTON_ORDER)
+        ):
+            toggle_button_order = list(DEFAULT_TOGGLE_BUTTON_ORDER)
         return cls(
             pet_id=data.get("pet_id", "pet_001"),
             name=data.get("name", "ぽちこ"),
@@ -133,6 +148,7 @@ class PetState:
             evolution_stage=data.get("evolution_stage", "child"),
             notifications_enabled=settings.get("notifications_enabled", True),
             window_position=settings.get("window_position", [1200, 650]),
+            toggle_button_order=toggle_button_order,
         )
 
     # --- 永続化 ---
