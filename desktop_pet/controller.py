@@ -78,6 +78,16 @@ class PetController:
         self.state.window_position = [window_pos[0], window_pos[1]]
         self._app.quit()
 
+    def set_pet_name(self, name: str) -> None:
+        """ペット名を設定する（入力欄のtextChangedから都度呼ばれる想定）。
+
+        空文字列も許容し、その場合は「未設定」に戻す（会話機能が使えなくなる）。
+        文字数・使用可能文字のバリデーションはQLineEdit側（setMaxLength・
+        カスタムバリデータ）で入力段階に行うため、ここでは単純に反映するだけでよい。
+        """
+        self.state.name = name
+        self._on_change()
+
     def submit_chat_message(
         self,
         text: str,
@@ -93,6 +103,10 @@ class PetController:
         """
         if self._active_chat_worker is not None:
             on_error("busy", "前回の送信の返信待ちです。")
+            return False
+
+        if not self.state.name:
+            on_error("no_name", "まずは名前をつけよう")
             return False
 
         api_key = self._get_api_key()

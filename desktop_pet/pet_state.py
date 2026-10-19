@@ -25,9 +25,31 @@ DEFAULT_TOGGLE_BUTTON_ORDER = ["quit", "menu", "status", "grip_design", "always_
 
 CHAT_HISTORY_MAX_LEN = 20  # 保存する会話履歴の上限件数（将来の繰り返し検出ロジック等が参照する範囲）
 
+PET_NAME_MAX_LEN = 15  # ペット名の最大文字数
+
 
 def _clamp(value: float) -> float:
     return max(STATUS_MIN, min(STATUS_MAX, value))
+
+
+def validate_pet_name(name: str) -> str | None:
+    """ペット名として使える文字列かを検証する。
+
+    使えない場合はエラーメッセージを返し、問題なければNoneを返す
+    （exeでの環境依存文字化け・表示崩れを避けるため、絵文字や制御文字は禁止する）。
+    """
+    stripped = name.strip()
+    if not stripped:
+        return "名前を入力してください。"
+    if len(stripped) > PET_NAME_MAX_LEN:
+        return f"名前は{PET_NAME_MAX_LEN}文字以内で入力してください。"
+    for ch in stripped:
+        codepoint = ord(ch)
+        # 制御文字、およびサロゲートペア対象(絵文字等の多くが該当する0x1F000以降)を禁止する。
+        # 基本多言語面（日本語・英数字・一般記号を含む）はそのまま許可する。
+        if codepoint < 0x20 or codepoint == 0x7F or codepoint > 0xFFFF:
+            return "絵文字や特殊な記号は名前に使用できません。"
+    return None
 
 
 @dataclass
@@ -45,7 +67,9 @@ class ChatHistoryEntry:
 @dataclass
 class PetState:
     pet_id: str = "pet_001"
-    name: str = "ぽちこ"
+    # 空文字列は「名前未設定」を表す（名前を付けるまで会話機能は使わせない）。
+    # 既存セーブデータを持つユーザーは引き続き保存済みの名前（例: "ぽちこ"）が読み込まれる。
+    name: str = ""
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     last_updated: str = field(default_factory=lambda: datetime.now().isoformat())
     virtual_time_offset_minutes: float = 0.0
@@ -190,7 +214,7 @@ class PetState:
 
         return cls(
             pet_id=data.get("pet_id", "pet_001"),
-            name=data.get("name", "ぽちこ"),
+            name=data.get("name", ""),
             created_at=data.get("created_at", datetime.now().isoformat()),
             last_updated=data.get("last_updated", datetime.now().isoformat()),
             virtual_time_offset_minutes=data.get("virtual_time_offset_minutes", 0.0),

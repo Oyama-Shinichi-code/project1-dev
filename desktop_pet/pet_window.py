@@ -24,7 +24,18 @@ from PySide6.QtCore import (
     Qt,
     QTimer,
 )
-from PySide6.QtGui import QColor, QCursor, QIcon, QMouseEvent, QPainter, QPaintEvent, QPen, QPixmap, QShowEvent
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QIcon,
+    QMouseEvent,
+    QPainter,
+    QPaintEvent,
+    QPen,
+    QPixmap,
+    QShowEvent,
+    QValidator,
+)
 from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHBoxLayout,
@@ -41,7 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from desktop_pet.controller import TIME_CONTROLS, PetController
-from desktop_pet.pet_state import ChatHistoryEntry
+from desktop_pet.pet_state import PET_NAME_MAX_LEN, ChatHistoryEntry
 from desktop_pet.effects import ParticleEffectWidget, make_crumb_config, make_sparkle_config
 
 ASSETS_DIR = Path(__file__).parent / "assets" / "pet"
@@ -143,6 +154,22 @@ def _make_scaling_icon(size: int) -> QIcon:
 
 
 DRAG_START_THRESHOLD_PX = 6  # この距離以上動いたら「クリック」ではなく「並び替えドラッグ」とみなす
+
+
+class _PetNameValidator(QValidator):
+    """ペット名入力欄用。絵文字・制御文字を入力段階でブロックする（文字数はsetMaxLengthで制限）。
+
+    PetState.validate_pet_nameの文字コード判定（BMP外=主に絵文字、制御文字を禁止）と
+    同じ基準を使う。文字数チェックはQLineEdit.setMaxLengthに任せるため、ここでは
+    文字種のみを見る。
+    """
+
+    def validate(self, input_text: str, pos: int) -> tuple:
+        for ch in input_text:
+            codepoint = ord(ch)
+            if codepoint < 0x20 or codepoint == 0x7F or codepoint > 0xFFFF:
+                return (QValidator.Invalid, input_text, pos)
+        return (QValidator.Acceptable, input_text, pos)
 
 
 class _DraggableToggleButton(QPushButton):
@@ -341,6 +368,7 @@ class PetWindow(QWidget):
         self._build_always_on_top_toggle_button()
         self._build_chat_toggle_button()
         self._build_chat_panel()
+        self._update_chat_input_availability()
         self._all_toggle_buttons = (
             self.quit_toggle_button,
             self.menu_toggle_button,
@@ -957,10 +985,32 @@ class PetWindow(QWidget):
 
         panel_layout.addLayout(input_row)
         panel_layout.addWidget(self.chat_result_scroll)
-        # 閉じるボタン用の余白をレイアウト内に確保する（chat_panel自体の高さに
-        # 含めることで、下に続くstatus_panel等が自動的にその分押し下げられ、
-        # 重なりが構造的に起きないようにする）。
-        panel_layout.addSpacing(MENU_TOGGLE_SIZE + CHAT_CLOSE_BUTTON_MARGIN)
+
+        # 最下段: 閉じるボタン分の空白＋名前設定欄（×ボタンの右横）。
+        # ×ボタン自体はchat_panelの子として絶対配置で重ねるため、ここではその
+        # 横幅分だけ空けたQHBoxLayoutを用意する（chat_panel自体の高さに含める
+        # ことで、下に続くstatus_panel等が自動的に押し下げられ重ならない）。
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(4)
+        bottom_row.addSpacing(MENU_TOGGLE_SIZE + 4)  # ×ボタンの場所を空ける
+        self.pet_name_input = QLineEdit(self.chat_panel)
+        self.pet_name_input.setPlaceholderText("名前を入力...")
+        self.pet_name_input.setMaxLength(PET_NAME_MAX_LEN)
+        self.pet_name_input.setValidator(_PetNameValidator(self.pet_name_input))
+        self.pet_name_input.setStyleSheet(
+            "background-color: rgba(255, 255, 255, 230); border-radius: 4px; padding: 2px 4px;"
+        )
+        # 既存のセーブデータに名前が保存済みなら入力欄にプリフィルする
+        # （blockSignalsしてセットすることで、プリフィル自体がtextChanged経由で
+        # 不要なset_pet_name呼び出しを起こさないようにする）。
+        self.pet_name_input.blockSignals(True)
+        self.pet_name_input.setText(self.state.name)
+        self.pet_name_input.blockSignals(False)
+        # 設定ボタンは置かず、入力するたびにリアルタイムで名前を反映する。
+        # 入力済みの文字列はクリアせず残し続ける（常にそのまま「現在の名前」として機能する）。
+        self.pet_name_input.textChanged.connect(self._on_pet_name_changed)
+        bottom_row.addWidget(self.pet_name_input)
+        panel_layout.addLayout(bottom_row)
 
         # 評価スコア(mood変化量)をふわっと表示するラベル。chat_panelの右上に重ねて
         # 絶対配置し、結果が出るたびにフェードイン→少し上に浮かびながら消える。
@@ -974,7 +1024,7 @@ class PetWindow(QWidget):
         self.chat_score_label.hide()
 
         # 閉じるボタン（背景・枠なしの赤い×のみ）。chat_panelの子にして、
-        # 上で確保した余白部分（chat_panel下端寄り）に絶対配置で重ねる。
+        # bottom_rowで空けておいた左側のスペースに絶対配置で重ねる。
         self.chat_close_button = QPushButton("✕", self.chat_panel)
         self.chat_close_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
         self.chat_close_button.setStyleSheet(
@@ -998,6 +1048,8 @@ class PetWindow(QWidget):
         """
         self._raise_resize_grips()
         self._chat_open = not self._chat_open
+        if self._chat_open:
+            self._update_chat_input_availability()
         target_panel_height = self._chat_panel_open_height if self._chat_open else 0
 
         current_geo = self.geometry()
@@ -1048,15 +1100,13 @@ class PetWindow(QWidget):
             self._reposition_chat_close_button()
 
     def _reposition_chat_close_button(self) -> None:
-        """閉じるボタンをchat_panel内の最下部（_build_chat_panelでaddSpacingした余白）に配置する。
+        """閉じるボタンをchat_panel最下段（名前設定欄と同じ行）の左側に配置する。
 
         chat_close_buttonはchat_panelの子ウィジェットなので、座標はchat_panel内の
-        相対位置で指定する（status_panel等との重なりは、この余白をchat_panel自体の
-        高さに含めることで構造的に防いでいる）。
+        相対位置で指定する。bottom_row(名前設定欄の行)がaddSpacingで空けておいた
+        左側のスペースに、pet_name_inputとy座標を揃えて重ねる。
         """
-        self.chat_close_button.move(
-            8, self.chat_panel.height() - MENU_TOGGLE_SIZE - 4
-        )
+        self.chat_close_button.move(8, self.pet_name_input.y())
         self.chat_close_button.raise_()
 
     def _raise_resize_grips(self) -> None:
@@ -1334,6 +1384,7 @@ class PetWindow(QWidget):
         self.chat_send_button.setEnabled(True)
         display = {
             "no_api_key": "APIキーが設定されていません。",
+            "no_name": "まずは名前をつけよう",
             "busy": "前回の返信を待っています…",
             "network": "通信エラーが発生しました。ネットワークを確認してください。",
             "http": "APIからエラー応答がありました。しばらくしてから再試行してください。",
@@ -1341,6 +1392,21 @@ class PetWindow(QWidget):
             "unknown": "予期しないエラーが発生しました。",
         }.get(kind, "エラーが発生しました。")
         self.chat_result_label.setText(display)
+        self.chat_result_label.setStyleSheet("color: white; font-size: 12px;")
+
+    def _on_pet_name_changed(self, text: str) -> None:
+        """名前入力欄の変更のたびに呼ばれる。入力内容をそのままstate.nameへ反映する。"""
+        self.controller.set_pet_name(text)
+        self._update_chat_input_availability()
+
+    def _update_chat_input_availability(self) -> None:
+        """名前未設定の間は会話の送信欄を無効化し、プレースホルダーで案内する。"""
+        has_name = bool(self.state.name)
+        self.chat_input.setEnabled(has_name)
+        self.chat_send_button.setEnabled(has_name)
+        self.chat_input.setPlaceholderText(
+            "話しかけてみる..." if has_name else "まずは名前をつけよう"
+        )
 
     # --- 見た目更新 ---
     def refresh_appearance(self) -> None:
