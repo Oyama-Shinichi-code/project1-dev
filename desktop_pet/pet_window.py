@@ -29,9 +29,11 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QVBoxLayout,
@@ -39,6 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 from desktop_pet.controller import TIME_CONTROLS, PetController
+from desktop_pet.pet_state import ChatHistoryEntry
 from desktop_pet.effects import ParticleEffectWidget, make_crumb_config, make_sparkle_config
 
 ASSETS_DIR = Path(__file__).parent / "assets" / "pet"
@@ -98,6 +101,10 @@ RESIZE_GRIP_SIZE = 32  # 角のリサイズグリップのサイズ(px、ウィ�
 
 MENU_TOGGLE_SIZE = 24  # メニュートグルボタンのサイズ(px、スケール不問の固定値)
 MENU_ANIM_DURATION_MS = 240  # メニュー開閉アニメーションの時間(ms)
+CHAT_PANEL_WIDTH = 220  # 会話入力パネルの幅(px、スケール不問)
+CHAT_PANEL_HEIGHT = 110  # 会話入力パネルの高さ(px、スケール不問)
+CHAT_SCORE_ANIM_DURATION_MS = 1400  # 評価スコア表示がフェードイン→浮かんで消えるまでの時間
+CHAT_CLOSE_BUTTON_MARGIN = 6  # 閉じるボタンとchat_panel下端の間の余白(px)
 
 
 def _make_scaling_icon(size: int) -> QIcon:
@@ -299,6 +306,9 @@ class PetWindow(QWidget):
         self._status_open = False  # ステータスパネル（折りたたみメニュー）の開閉状態
         self._status_animation_group: QParallelAnimationGroup | None = None  # 実行中のステータスパネル開閉アニメーション(多重開始防止用に保持)
         self._status_panel_open_height = 0  # 開いた時のstatus_panelの高さ(px)。_apply_scaleで確定する
+        self._chat_open = False  # 会話入力パネルの開閉状態
+        self._chat_animation_group: QParallelAnimationGroup | None = None  # 実行中の会話パネル開閉アニメーション(多重開始防止用に保持)
+        self._chat_panel_open_height = 0  # 開いた時のchat_panelの高さ(px)。_apply_scaleで確定する
 
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
@@ -329,12 +339,15 @@ class PetWindow(QWidget):
         self._build_status_toggle_button()
         self._build_grip_design_toggle_button()
         self._build_always_on_top_toggle_button()
+        self._build_chat_toggle_button()
+        self._build_chat_panel()
         self._all_toggle_buttons = (
             self.quit_toggle_button,
             self.menu_toggle_button,
             self.status_toggle_button,
             self.grip_design_toggle_button,
             self.always_on_top_toggle_button,
+            self.chat_toggle_button,
         )
         # ボタンID→ウィジェットの対応表。並び順はstate.toggle_button_orderが正であり、
         # ここはIDから実体を引くためだけに使う（今後ボタンが増えてもここに1行
@@ -351,6 +364,10 @@ class PetWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
+        # chat_panelはstatus_panelよりさらに上（ウィンドウ最上部）に出すため、
+        # レイアウトの一番最初に追加する。両方ともmaximumHeightで畳む方式なので、
+        # 同時に開いても自動的に縦に積まれ、ペット画像や互いに重ならない。
+        layout.addWidget(self.chat_panel)
         layout.addWidget(self.status_panel)
         layout.addWidget(self.anim_speed_panel)
         layout.addWidget(self.label)
@@ -364,9 +381,10 @@ class PetWindow(QWidget):
         # レイアウト管理から外し絶対配置にする（geometryを自由にアニメーションさせるため）。
         # 開閉中のウィンドウ全体の高さ拡張は_toggle_menu内で手動計算する。
 
-        # メニュー・ステータスパネルは初期状態で閉じておく（maximumHeight=0/非表示で畳む）
+        # メニュー・ステータスパネル・会話パネルは初期状態で閉じておく（maximumHeight=0/非表示で畳む）
         self.button_bar.hide()
         self.status_panel.setMaximumHeight(0)
+        self.chat_panel.setMaximumHeight(0)
 
         # リサイズグリップ（四隅）・トグルボタン類はレイアウト管理外の
         # 子ウィジェットとして絶対配置する（他のウィジェットの上に重ねて表示するため、layoutには追加しない）
@@ -460,6 +478,7 @@ class PetWindow(QWidget):
             self.menu_toggle_button,
             self.status_toggle_button,
             self.always_on_top_toggle_button,
+            self.chat_toggle_button,
         ):
             style = toggle_button.styleSheet()
             toggle_button.setStyleSheet(style.replace("font-size: 14px", f"font-size: {toggle_font_px}px"))
@@ -509,6 +528,17 @@ class PetWindow(QWidget):
         self._status_panel_open_height = self.status_panel.sizeHint().height()
         if self._status_open:
             self.status_panel.setMaximumHeight(self._status_panel_open_height)
+
+        # chat_panelもstatus_panelと同じ理由で幅を固定し、開いた高さを更新する。
+        # 本体の高さはウィンドウの縦サイズに対して固定割合（最大CHAT_PANEL_HEIGHT）にし、
+        # そこに閉じるボタン用の余白（panel_layout.addSpacingで確保済み）を加えた
+        # sizeHint().height()を実際の「開いた高さ」として使う。
+        self.chat_panel.setFixedWidth(pet_size)
+        content_height = min(CHAT_PANEL_HEIGHT, max(80, int(pet_size * 0.6)))
+        self.chat_result_scroll.setMinimumHeight(max(20, content_height - 40))
+        self._chat_panel_open_height = self.chat_panel.sizeHint().height()
+        if self._chat_open:
+            self.chat_panel.setMaximumHeight(self._chat_panel_open_height)
 
         # レイアウト管理下の子ウィジェットのサイズ変更をウィンドウ全体に反映させる。
         # adjustSize()単体だと、一度大きくなったウィンドウが縮小方向にはうまく
@@ -857,6 +887,178 @@ class PetWindow(QWidget):
         """最背面モード中、定期的にウィンドウを最背面へ送り直す（_keep_bottom_timer用）。"""
         _set_window_z_order(int(self.winId()), _HWND_BOTTOM)
 
+    def _build_chat_toggle_button(self) -> None:
+        """話しかける機能のON/OFFを切り替えるボタン（💬）。
+
+        見た目は他のトグルボタンと統一し、縦積みスタックの一員として並び替え対象になる。
+        """
+        self.chat_toggle_button = _DraggableToggleButton("chat", self, self)
+        self.chat_toggle_button.setText("💬")
+        self.chat_toggle_button.setToolTip("話しかける（ドラッグで並び替え可能）")
+        self.chat_toggle_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
+        self.chat_toggle_button.setStyleSheet(
+            "QPushButton {"
+            " background-color: rgba(60, 60, 60, 200);"
+            " border: 1.5px solid rgba(255, 255, 255, 220);"
+            " border-radius: 6px; font-size: 14px; color: white;"
+            "}"
+            "QPushButton:hover { background-color: rgba(90, 90, 90, 220); }"
+        )
+        self.chat_toggle_button.clicked.connect(self._toggle_chat_panel)
+
+    def _build_chat_panel(self) -> None:
+        """話しかける入力欄パネル（テキスト入力＋送信ボタン＋スクロール可能な結果表示）。
+
+        status_panelと同様、ウィンドウ最上部（status_panelが開いていればそのさらに上）に
+        配置する絶対配置パネル。ウィンドウ全体のgeometryも開閉に合わせて拡張する。
+        """
+        self.chat_panel = QWidget(self)
+        self.chat_panel.setStyleSheet(
+            "background-color: rgba(30, 30, 30, 230);"
+            " border: 1.5px solid rgba(255, 255, 255, 200); border-radius: 8px;"
+        )
+        panel_layout = QVBoxLayout(self.chat_panel)
+        panel_layout.setContentsMargins(8, 8, 8, 8)
+        panel_layout.setSpacing(6)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(4)
+        self.chat_input = QLineEdit(self.chat_panel)
+        self.chat_input.setPlaceholderText("話しかけてみる...")
+        self.chat_input.setStyleSheet(
+            "background-color: rgba(255, 255, 255, 230); border-radius: 4px; padding: 2px 4px;"
+        )
+        self.chat_input.returnPressed.connect(self._on_chat_send_clicked)
+        self.chat_send_button = QPushButton("送信", self.chat_panel)
+        self.chat_send_button.setStyleSheet(
+            "QPushButton {"
+            " background-color: rgba(255, 255, 255, 160);"
+            " border: none; border-radius: 6px; font-size: 12px;"
+            "}"
+            "QPushButton:hover { background-color: rgba(255, 255, 255, 220); }"
+            "QPushButton:disabled { background-color: rgba(255, 255, 255, 60); }"
+        )
+        self.chat_send_button.clicked.connect(self._on_chat_send_clicked)
+        input_row.addWidget(self.chat_input)
+        input_row.addWidget(self.chat_send_button)
+
+        # ナレーションが長い場合に見切れないよう、結果表示部分をスクロール可能にする
+        self.chat_result_label = QLabel("", self.chat_panel)
+        self.chat_result_label.setWordWrap(True)
+        self.chat_result_label.setStyleSheet("color: white; font-size: 12px;")
+        self.chat_result_scroll = QScrollArea(self.chat_panel)
+        self.chat_result_scroll.setWidget(self.chat_result_label)
+        self.chat_result_scroll.setWidgetResizable(True)
+        self.chat_result_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            " QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        self.chat_result_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        panel_layout.addLayout(input_row)
+        panel_layout.addWidget(self.chat_result_scroll)
+        # 閉じるボタン用の余白をレイアウト内に確保する（chat_panel自体の高さに
+        # 含めることで、下に続くstatus_panel等が自動的にその分押し下げられ、
+        # 重なりが構造的に起きないようにする）。
+        panel_layout.addSpacing(MENU_TOGGLE_SIZE + CHAT_CLOSE_BUTTON_MARGIN)
+
+        # 評価スコア(mood変化量)をふわっと表示するラベル。chat_panelの右上に重ねて
+        # 絶対配置し、結果が出るたびにフェードイン→少し上に浮かびながら消える。
+        self.chat_score_label = QLabel("", self.chat_panel)
+        self.chat_score_label.setStyleSheet(
+            "color: rgba(255, 230, 120, 255); font-size: 14px; font-weight: bold;"
+            " background: transparent;"
+        )
+        self.chat_score_label.setAlignment(Qt.AlignRight)
+        self.chat_score_label.adjustSize()
+        self.chat_score_label.hide()
+
+        # 閉じるボタン（背景・枠なしの赤い×のみ）。chat_panelの子にして、
+        # 上で確保した余白部分（chat_panel下端寄り）に絶対配置で重ねる。
+        self.chat_close_button = QPushButton("✕", self.chat_panel)
+        self.chat_close_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
+        self.chat_close_button.setStyleSheet(
+            "QPushButton {"
+            " background: transparent; border: none;"
+            " color: rgba(230, 60, 60, 255); font-size: 16px; font-weight: bold;"
+            "}"
+            "QPushButton:hover { color: rgba(255, 90, 90, 255); }"
+        )
+        self.chat_close_button.clicked.connect(self._toggle_chat_panel)
+        self.chat_close_button.hide()
+
+    def _toggle_chat_panel(self) -> None:
+        """会話パネルの開閉状態をアニメーション付きで切り替える（_toggle_status_panelと同じ仕組み）。
+
+        chat_panelはレイアウト内でstatus_panelより上（ウィンドウ最上部）に
+        配置してあるため、maximumHeightアニメーションで開閉すれば、status_panelや
+        label等の他要素は自動的に押し下げられ、重なりが構造的に起きない
+        （以前の絶対配置オーバーレイ方式はペット画像に重なる不具合があったため、
+        status_panelと同じレイアウト内方式に作り直した）。
+        """
+        self._raise_resize_grips()
+        self._chat_open = not self._chat_open
+        target_panel_height = self._chat_panel_open_height if self._chat_open else 0
+
+        current_geo = self.geometry()
+        height_diff = target_panel_height - self.chat_panel.maximumHeight()
+        # status_panelと同じく「下から上に」展開させるため、高さが増える分だけ
+        # y座標を上へ動かし、ウィンドウの下端を固定点として扱う。
+        target_geo = QRect(
+            current_geo.x(),
+            current_geo.y() - height_diff,
+            current_geo.width(),
+            current_geo.height() + height_diff,
+        )
+
+        if self._chat_animation_group is not None:
+            self._chat_animation_group.stop()
+
+        panel_anim = QPropertyAnimation(self.chat_panel, b"maximumHeight", self)
+        panel_anim.setDuration(MENU_ANIM_DURATION_MS)
+        panel_anim.setStartValue(self.chat_panel.maximumHeight())
+        panel_anim.setEndValue(target_panel_height)
+        panel_anim.setEasingCurve(QEasingCurve.InOutCubic)
+
+        geo_anim = QPropertyAnimation(self, b"geometry", self)
+        geo_anim.setDuration(MENU_ANIM_DURATION_MS)
+        geo_anim.setStartValue(current_geo)
+        geo_anim.setEndValue(target_geo)
+        geo_anim.setEasingCurve(QEasingCurve.InOutCubic)
+
+        group = QParallelAnimationGroup(self)
+        group.addAnimation(panel_anim)
+        group.addAnimation(geo_anim)
+        group.finished.connect(self._on_chat_animation_finished)
+        self._chat_animation_group = group
+        group.start()
+
+        if self._chat_open:
+            self.chat_input.setFocus()
+            self.chat_close_button.show()
+            self.chat_close_button.raise_()
+        else:
+            self.chat_close_button.hide()
+
+    def _on_chat_animation_finished(self) -> None:
+        """会話パネル開閉アニメーション終了時、グリップ再配置と閉じるボタン位置更新を行う。"""
+        self._chat_animation_group = None
+        self._reposition_overlay_widgets()
+        if self._chat_open:
+            self._reposition_chat_close_button()
+
+    def _reposition_chat_close_button(self) -> None:
+        """閉じるボタンをchat_panel内の最下部（_build_chat_panelでaddSpacingした余白）に配置する。
+
+        chat_close_buttonはchat_panelの子ウィジェットなので、座標はchat_panel内の
+        相対位置で指定する（status_panel等との重なりは、この余白をchat_panel自体の
+        高さに含めることで構造的に防いでいる）。
+        """
+        self.chat_close_button.move(
+            8, self.chat_panel.height() - MENU_TOGGLE_SIZE - 4
+        )
+        self.chat_close_button.raise_()
+
     def _raise_resize_grips(self) -> None:
         """リサイズグリップを最前面に上げ直す。
 
@@ -1053,6 +1255,92 @@ class PetWindow(QWidget):
 
     def _on_quit_clicked(self) -> None:
         self.controller.quit((self.pos().x(), self.pos().y()))
+
+    # --- 会話機能 ---
+    def _on_chat_send_clicked(self) -> None:
+        text = self.chat_input.text().strip()
+        if not text:
+            return
+        self.chat_send_button.setEnabled(False)
+        self.chat_result_label.setText("考え中…")
+        started = self.controller.submit_chat_message(
+            text, self._on_chat_result, self._on_chat_error
+        )
+        if not started:
+            self.chat_send_button.setEnabled(True)
+
+    def _on_chat_result(self, entry: ChatHistoryEntry) -> None:
+        self.chat_input.clear()
+        self.chat_send_button.setEnabled(True)
+        if entry.is_inappropriate:
+            # AIが生成したナレーション文は表示せず、クライアント側で固定の注意文を
+            # 赤字表示する（AIの出力をそのまま信頼しない方が安全なため）。
+            self.chat_result_label.setText("不適切なワードが含まれているため，ペットには伝えませんでした")
+            self.chat_result_label.setStyleSheet("color: rgba(255, 100, 100, 255); font-size: 12px;")
+        else:
+            self.chat_result_label.setText(entry.narration)
+            self.chat_result_label.setStyleSheet("color: white; font-size: 12px;")
+        self.refresh_appearance()  # mood変化を表情に反映
+        if entry.mood_delta != 0.0:
+            self._play_chat_score_animation(entry.mood_delta)
+
+    def _play_chat_score_animation(self, mood_delta: float) -> None:
+        """評価スコア(mood変化量)をchat_panel右上にふわっと表示する。
+
+        符号付きの数値（例: +9.3 / -6.1）をフェードインしつつ少し上に浮かべ、
+        最後にフェードアウトして消す（_play_full_heartと同じ演出パターン）。
+        """
+        sign = "+" if mood_delta >= 0 else ""
+        self.chat_score_label.setText(f"{sign}{mood_delta:.1f}")
+        self.chat_score_label.setStyleSheet(
+            "color: rgba(255, 230, 120, 255); font-size: 14px; font-weight: bold;"
+            " background: transparent;"
+            if mood_delta >= 0
+            else "color: rgba(255, 120, 120, 255); font-size: 14px; font-weight: bold;"
+            " background: transparent;"
+        )
+        self.chat_score_label.adjustSize()
+
+        start_x = self.chat_panel.width() - self.chat_score_label.width() - 10
+        start_y = 6
+        self.chat_score_label.move(start_x, start_y)
+        opacity_effect = QGraphicsOpacityEffect(self.chat_score_label)
+        self.chat_score_label.setGraphicsEffect(opacity_effect)
+        self.chat_score_label.show()
+        self.chat_score_label.raise_()
+
+        pos_anim = QPropertyAnimation(self.chat_score_label, b"pos", self)
+        pos_anim.setDuration(CHAT_SCORE_ANIM_DURATION_MS)
+        pos_anim.setStartValue(QPoint(start_x, start_y))
+        pos_anim.setEndValue(QPoint(start_x, start_y - 16))
+        pos_anim.setEasingCurve(QEasingCurve.OutCubic)
+
+        opacity_anim = QPropertyAnimation(opacity_effect, b"opacity", self)
+        opacity_anim.setDuration(CHAT_SCORE_ANIM_DURATION_MS)
+        opacity_anim.setKeyValueAt(0.0, 0.0)
+        opacity_anim.setKeyValueAt(0.2, 1.0)
+        opacity_anim.setKeyValueAt(0.7, 1.0)
+        opacity_anim.setKeyValueAt(1.0, 0.0)
+
+        def on_finished() -> None:
+            self.chat_score_label.hide()
+
+        opacity_anim.finished.connect(on_finished)
+        self._chat_score_anim_refs = (pos_anim, opacity_anim)  # GC防止
+        pos_anim.start()
+        opacity_anim.start()
+
+    def _on_chat_error(self, kind: str, message: str) -> None:
+        self.chat_send_button.setEnabled(True)
+        display = {
+            "no_api_key": "APIキーが設定されていません。",
+            "busy": "前回の返信を待っています…",
+            "network": "通信エラーが発生しました。ネットワークを確認してください。",
+            "http": "APIからエラー応答がありました。しばらくしてから再試行してください。",
+            "parse": "応答の解析に失敗しました。",
+            "unknown": "予期しないエラーが発生しました。",
+        }.get(kind, "エラーが発生しました。")
+        self.chat_result_label.setText(display)
 
     # --- 見た目更新 ---
     def refresh_appearance(self) -> None:

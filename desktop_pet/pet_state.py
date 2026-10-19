@@ -21,11 +21,25 @@ STATUS_MIN = 0
 STATUS_MAX = 100
 
 DEFAULT_DATA_PATH = Path(__file__).parent / "data" / "pet_state.json"
-DEFAULT_TOGGLE_BUTTON_ORDER = ["quit", "menu", "status", "grip_design", "always_on_top"]
+DEFAULT_TOGGLE_BUTTON_ORDER = ["quit", "menu", "status", "grip_design", "always_on_top", "chat"]
+
+CHAT_HISTORY_MAX_LEN = 20  # 保存する会話履歴の上限件数（将来の繰り返し検出ロジック等が参照する範囲）
 
 
 def _clamp(value: float) -> float:
     return max(STATUS_MIN, min(STATUS_MAX, value))
+
+
+@dataclass
+class ChatHistoryEntry:
+    """会話1往復分の記録（ユーザー発言・AIのナレーション・評価・mood変化量）。"""
+
+    user_text: str
+    narration: str
+    level: str
+    mood_delta: float
+    timestamp: str  # isoformat
+    is_inappropriate: bool = False
 
 
 @dataclass
@@ -47,6 +61,9 @@ class PetState:
     toggle_button_order: list[str] = field(
         default_factory=lambda: list(DEFAULT_TOGGLE_BUTTON_ORDER)
     )
+    # 会話機能の履歴（直近CHAT_HISTORY_MAX_LEN件）。将来の評価ロジック高度化
+    # （同一発言の繰り返し検出等）で参照する想定。
+    chat_history: list[ChatHistoryEntry] = field(default_factory=list)
 
     # --- 現在時刻（仮想オフセット込み） ---
     def virtual_now(self) -> datetime:
@@ -92,6 +109,10 @@ class PetState:
     def pet(self, amount: float = 15.0) -> None:
         self.mood = _clamp(self.mood + amount)
 
+    def apply_chat_mood_delta(self, delta: float) -> None:
+        """会話評価によるmood変化を反映する（mood_rules.compute_mood_deltaの結果を渡す）。"""
+        self.mood = _clamp(self.mood + delta)
+
     # --- 見た目切り替え用の表情判定 ---
     def current_expression(self, hungry_threshold: float = 30.0, angry_threshold: float = 30.0) -> str:
         """優先順位: hungry > angry > normal。"""
@@ -121,6 +142,18 @@ class PetState:
                 "window_position": self.window_position,
                 "toggle_button_order": self.toggle_button_order,
             },
+            # 直近CHAT_HISTORY_MAX_LEN件のみ保存し、無限に肥大化しないようにする
+            "chat_history": [
+                {
+                    "user_text": entry.user_text,
+                    "narration": entry.narration,
+                    "level": entry.level,
+                    "mood_delta": entry.mood_delta,
+                    "timestamp": entry.timestamp,
+                    "is_inappropriate": entry.is_inappropriate,
+                }
+                for entry in self.chat_history[-CHAT_HISTORY_MAX_LEN:]
+            ],
         }
 
     @classmethod
@@ -135,6 +168,26 @@ class PetState:
             or set(toggle_button_order) != set(DEFAULT_TOGGLE_BUTTON_ORDER)
         ):
             toggle_button_order = list(DEFAULT_TOGGLE_BUTTON_ORDER)
+
+        raw_chat_history = data.get("chat_history")
+        chat_history: list[ChatHistoryEntry] = []
+        if isinstance(raw_chat_history, list):
+            for raw_entry in raw_chat_history:
+                try:
+                    chat_history.append(
+                        ChatHistoryEntry(
+                            user_text=raw_entry["user_text"],
+                            narration=raw_entry["narration"],
+                            level=raw_entry["level"],
+                            mood_delta=raw_entry["mood_delta"],
+                            timestamp=raw_entry["timestamp"],
+                            is_inappropriate=raw_entry.get("is_inappropriate", False),
+                        )
+                    )
+                except (KeyError, TypeError):
+                    # 壊れたエントリは無視する（1件の破損で全体を失わないため）
+                    continue
+
         return cls(
             pet_id=data.get("pet_id", "pet_001"),
             name=data.get("name", "ぽちこ"),
@@ -149,6 +202,7 @@ class PetState:
             notifications_enabled=settings.get("notifications_enabled", True),
             window_position=settings.get("window_position", [1200, 650]),
             toggle_button_order=toggle_button_order,
+            chat_history=chat_history,
         )
 
     # --- 永続化 ---

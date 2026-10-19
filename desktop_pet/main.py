@@ -10,6 +10,7 @@ import sys
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
+from desktop_pet.api_key_store import load_api_key, prompt_for_api_key, save_api_key
 from desktop_pet.controller import PetController
 from desktop_pet.pet_state import PetState
 from desktop_pet.pet_window import PetWindow
@@ -23,6 +24,13 @@ def main() -> None:
     # トレイアイコンのみでも動作継続できるようにする（ウィンドウを閉じても終了しない）
     app.setQuitOnLastWindowClosed(False)
 
+    # 会話機能用のGemini APIキーが未設定なら、起動時に一度だけ入力を求める。
+    # キャンセル/未入力でも起動は継続する（会話機能のみ使用不可、他の機能は通常通り）。
+    if not load_api_key():
+        entered_key = prompt_for_api_key()
+        if entered_key:
+            save_api_key(entered_key)
+
     state = PetState.load_or_create()
 
     # window は on_change コールバック内で参照するため、後から生成して紐付ける
@@ -32,7 +40,7 @@ def main() -> None:
         if window is not None:
             window.refresh_appearance()
 
-    controller = PetController(app, state, on_change=on_change)
+    controller = PetController(app, state, on_change=on_change, get_api_key=load_api_key)
 
     window = PetWindow(controller)
     window.show()
