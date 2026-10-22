@@ -133,3 +133,85 @@ class EvaluationWorker(QThread):
             self.evaluation_failed.emit(exc.kind, str(exc))
         except Exception as exc:  # noqa: BLE001 - 想定外の例外も必ずUIに届ける
             self.evaluation_failed.emit("unknown", str(exc))
+
+
+# --- アイドル実況（何も操作していない間、現在のステータスをユーモラスに実況する） ---
+
+IDLE_NARRATION_SYSTEM_PROMPT_TEMPLATE = (
+    "あなたは小動物を観察しているナレーターです。"
+    "与えられた現在のステータス（満腹度・機嫌・体力・なつき度レベル等、いずれも0〜100）を元に、"
+    "今の様子をユーモラスに実況してください。"
+    "「○○は」「この子が」のような主語は一切つけず、動作・状態の描写だけで"
+    "1文を完結させてください（例:「お腹いっぱいでぐったりしている」）。"
+    "20〜40文字程度の短い文章にしてください。絵文字は使わないでください。"
+)
+
+IDLE_NARRATION_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "narration": {"type": "STRING"},
+    },
+    "required": ["narration"],
+}
+
+
+def _build_idle_narration_prompt(status_summary: str) -> dict:
+    return {
+        "systemInstruction": {"parts": [{"text": IDLE_NARRATION_SYSTEM_PROMPT_TEMPLATE}]},
+        "contents": [{"parts": [{"text": status_summary}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": IDLE_NARRATION_RESPONSE_SCHEMA,
+        },
+    }
+
+
+def call_gemini_idle_narration(api_key: str, status_summary: str) -> str:
+    """現在のステータスを元にしたアイドル実況文をGemini APIに生成させる。
+
+    失敗時はGeminiApiErrorを投げる（呼び出し元は失敗時、実況の更新をスキップする想定）。
+    """
+    url = f"{GEMINI_API_BASE}/models/{GEMINI_MODEL}:generateContent"
+    try:
+        response = requests.post(
+            url,
+            params={"key": api_key},
+            json=_build_idle_narration_prompt(status_summary),
+            timeout=GEMINI_TIMEOUT_SECONDS,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise GeminiApiError("network", str(exc)) from exc
+
+    if response.status_code != 200:
+        raise GeminiApiError("http", f"HTTP {response.status_code}: {response.text[:200]}")
+
+    try:
+        data = response.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(text)
+        narration = parsed["narration"]
+    except (KeyError, IndexError, json.JSONDecodeError, TypeError) as exc:
+        raise GeminiApiError("parse", f"応答の解析に失敗しました: {exc}") from exc
+
+    return narration
+
+
+class IdleNarrationWorker(QThread):
+    """アイドル実況のGemini API呼び出しを別スレッドで行うワーカー。"""
+
+    narration_succeeded = Signal(str)
+    narration_failed = Signal(str, str)  # (kind, message)
+
+    def __init__(self, api_key: str, status_summary: str, parent=None) -> None:
+        super().__init__(parent)
+        self._api_key = api_key
+        self._status_summary = status_summary
+
+    def run(self) -> None:
+        try:
+            narration = call_gemini_idle_narration(self._api_key, self._status_summary)
+            self.narration_succeeded.emit(narration)
+        except GeminiApiError as exc:
+            self.narration_failed.emit(exc.kind, str(exc))
+        except Exception as exc:  # noqa: BLE001 - 想定外の例外も必ずUIに届ける
+            self.narration_failed.emit("unknown", str(exc))

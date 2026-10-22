@@ -1,8 +1,8 @@
 """常駐の透過ウィンドウ（ペット本体表示）。
 
 - フレームレス・最前面・背景透過
-- クリックでなでるアクション
-- ドラッグで移動
+- なでるモードON中はキャラ上をドラッグでこすってなでるアクション
+- なでるモードOFF中はドラッグでウィンドウ移動
 - 画像下のボタン列（餌やり/なでる/時間操作/終了、折りたたみ可）
 - ステータスゲージ（満腹度/機嫌/体力、折りたたみ可）
 - 餌やりモーション（餌アイコン表示＋食べかすパーティクル＋完食ハート/あげすぎシェイク）
@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import ctypes
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -22,6 +23,7 @@ from PySide6.QtCore import (
     QRect,
     QSize,
     Qt,
+    QTime,
     QTimer,
 )
 from PySide6.QtGui import (
@@ -37,6 +39,7 @@ from PySide6.QtGui import (
     QValidator,
 )
 from PySide6.QtWidgets import (
+    QDialog,
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
@@ -47,12 +50,13 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from desktop_pet.controller import TIME_CONTROLS, PetController
-from desktop_pet.pet_state import PET_NAME_MAX_LEN, ChatHistoryEntry
+from desktop_pet.pet_state import PET_NAME_MAX_LEN, SLEEP_BEDTIME_MIN_LEVEL, SLEEP_NARRATION_TEXT, ChatHistoryEntry
 from desktop_pet.effects import ParticleEffectWidget, make_crumb_config, make_sparkle_config
 
 ASSETS_DIR = Path(__file__).parent / "assets" / "pet"
@@ -63,6 +67,8 @@ ANGRY_ANIM_DIR = ASSETS_DIR / "angry"
 ANGRY_ANIM_FRAMES = ["angry_flame1.png", "angry_flame2.png"]
 HUNGRY_ANIM_DIR = ASSETS_DIR / "hungry"
 HUNGRY_ANIM_FRAMES = ["hungry_flame1.png", "hungry_flame2.png"]
+SLEEPING_ANIM_DIR = ASSETS_DIR / "sleeping"
+SLEEPING_ANIM_FRAMES = ["sleeping_flame1.png"]  # 1フレームのみ(静止画)。複数フレーム用意されたら拡張可
 # 表情ごとの往復アニメーションフレーム一覧（この辞書に無い表情は静止画のまま）
 EXPRESSION_ANIM_FRAMES: dict[str, tuple[Path, list[str]]] = {
     "normal": (NORMAL_ANIM_DIR, NORMAL_ANIM_FRAMES),
@@ -95,11 +101,22 @@ def _set_window_z_order(hwnd: int, insert_after: int) -> None:
         hwnd, insert_after, 0, 0, 0, 0, _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE
     )
 
+
+def _format_narration_timestamp(timestamp: str) -> str:
+    """ナレーションログの日時表示用フォーマット（例: 10/21 14:30）。"""
+    try:
+        dt = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return timestamp
+    return dt.strftime("%m/%d %H:%M")
+
 FEED_ICON_DURATION_MS = 1000  # 餌アイコンのフェードイン→表示→フェードアウトの合計時間
 HEART_DURATION_MS = 2600  # 完食ハート演出の時間（確認しやすいよう通常の2倍に設定）
 SHAKE_DURATION_MS = 600  # あげすぎシェイクの時間
-PET_BOUNCE_DURATION_MS = 500  # なでるモーション（バウンド）の時間
 HAPPY_ANIM_INTERVAL_MS = 180  # ハート演出中の加速アニメーション間隔(ms)
+
+PET_STROKE_THRESHOLD_PX = 300  # なでるモード中、機嫌回復が発動するまでの累積移動距離(px、スケール不問)
+PET_STROKE_SPARKLE_INTERVAL_MS = 80  # こすっている間、キラキラを追加生成する間隔(ms)
 
 ANIM_SPEED_SLIDER_MIN_MS = 100  # 速度調整スライダーの最小間隔(ms)
 ANIM_SPEED_SLIDER_MAX_MS = 1000  # 速度調整スライダーの最大間隔(ms)
@@ -116,6 +133,13 @@ CHAT_PANEL_WIDTH = 220  # 会話入力パネルの幅(px、スケール不問)
 CHAT_PANEL_HEIGHT = 110  # 会話入力パネルの高さ(px、スケール不問)
 CHAT_SCORE_ANIM_DURATION_MS = 1400  # 評価スコア表示がフェードイン→浮かんで消えるまでの時間
 CHAT_CLOSE_BUTTON_MARGIN = 6  # 閉じるボタンとchat_panel下端の間の余白(px)
+
+NARRATION_BAR_HEIGHT = 26  # 常時表示ナレーション欄の高さ(px、スケール不問。枠・背景分の余白を含む)
+NARRATION_TYPEWRITER_INTERVAL_MS = 35  # タイプライター表示の1文字あたりの間隔(ms)
+NARRATION_DISPLAY_HOLD_MS = 4000  # 全文表示後、次のナレーションに切り替わるまで保持する時間(ms)
+NARRATION_SCROLL_INTERVAL_MS = 40  # 長文を左に流すスクロールの更新間隔(ms)
+NARRATION_SCROLL_STEP_PX = 1  # 1回の更新で左へ動かすピクセル数
+NARRATION_SCROLL_GAP_PX = 30  # テロップ方式でループする際、文末と再度現れる文頭の間隔(px)
 
 
 def _make_scaling_icon(size: int) -> QIcon:
@@ -336,6 +360,26 @@ class PetWindow(QWidget):
         self._chat_open = False  # 会話入力パネルの開閉状態
         self._chat_animation_group: QParallelAnimationGroup | None = None  # 実行中の会話パネル開閉アニメーション(多重開始防止用に保持)
         self._chat_panel_open_height = 0  # 開いた時のchat_panelの高さ(px)。_apply_scaleで確定する
+        self._pet_mode_on = False  # なでるモードのON/OFF（ONの間のみキャラ上でこすれる。トグルボタンで切り替え）
+        self._stroking = False  # 現在カーソルがキャラ上を押下＆移動中（こすり中）かどうか
+        self._stroke_last_pos: QPoint | None = None  # こすり中、直前のグローバル座標（累積移動距離の計算用）
+        self._stroke_accum_distance = 0.0  # こすりで蓄積した移動距離(px)。しきい値到達で機嫌回復しリセットする
+        self._stroke_hand_label: QLabel | None = None  # こすり中、カーソルに追従する手のマーク(🤚)
+        self._stroke_sparkle_timer: QTimer | None = None  # こすり中、キラキラを定期生成するタイマー
+        # 直近に処理したnarration_logのseq（新規追加分だけ検知するため）。
+        # 起動時点で既にセーブデータに溜まっている過去ログは「既読」として扱い、
+        # 起動直後に大量の過去ナレーションが一気に再生されるのを防ぐ。
+        self._narration_last_seq = self.state.narration_log[-1].seq if self.state.narration_log else 0
+        self._narration_queue: list[str] = []  # 表示待ちナレーションのキュー（1操作で複数件積まれた分を順番に出す）
+        self._narration_sleeping_display_active = False  # 睡眠中の固定表示を出している最中かどうか
+        self._narration_hold_forever = False  # 表示中のナレーションが自動で消えない(睡眠中固定表示)かどうか
+        self._narration_typewriter_timer: QTimer | None = None  # タイプライター表示用タイマー
+        self._narration_typewriter_text = ""  # タイプライター表示中の全文
+        self._narration_typewriter_index = 0  # タイプライター表示の現在の文字位置
+        self._narration_hold_timer: QTimer | None = None  # 全文表示後、消えるまでの保持タイマー
+        self._narration_scroll_timer: QTimer | None = None  # 長文を左に流すスクロール用タイマー
+        self._narration_scroll_x = 0  # スクロール中のnarration_labelのx座標（viewport基準）
+        self._narration_log_dialog: QDialog | None = None  # 開いているログ一覧ダイアログ（多重起動防止）
 
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
@@ -347,6 +391,20 @@ class PetWindow(QWidget):
         self.label.setAlignment(Qt.AlignCenter)
         # 透過PNGの透明部分からデスクトップが透けて見えるよう、ラベル自体の背景も透過にする
         self.label.setStyleSheet("background: transparent;")
+
+        # 構ってほしいイベント中に表示するアイコン（ペット画像の左上あたりに常駐、普段は非表示）。
+        self.attention_event_icon = QLabel("❗", self)
+        self.attention_event_icon.setStyleSheet("background: transparent;")
+        self.attention_event_icon.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.attention_event_icon.hide()
+
+        # レベル表示（ペット画像の左下に常駐、折りたたみ不要で常に見える）。
+        self.level_label = QLabel(self)
+        self.level_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.level_label.setStyleSheet(
+            "background-color: rgba(0, 0, 0, 170); color: white;"
+            " border: 1px solid rgba(255, 255, 255, 60); border-radius: 6px;"
+        )
 
         self._normal_anim_timer = QTimer(self)
         self._normal_anim_timer.setInterval(NORMAL_ANIM_INTERVAL_MS)
@@ -367,8 +425,11 @@ class PetWindow(QWidget):
         self._build_grip_design_toggle_button()
         self._build_always_on_top_toggle_button()
         self._build_chat_toggle_button()
+        self._build_bedtime_toggle_button()
+        self._build_debug_sleep_toggle_button()
         self._build_chat_panel()
         self._update_chat_input_availability()
+        self._build_narration_bar()
         self._all_toggle_buttons = (
             self.quit_toggle_button,
             self.menu_toggle_button,
@@ -376,6 +437,8 @@ class PetWindow(QWidget):
             self.grip_design_toggle_button,
             self.always_on_top_toggle_button,
             self.chat_toggle_button,
+            self.bedtime_toggle_button,
+            self.debug_sleep_toggle_button,
         )
         # ボタンID→ウィジェットの対応表。並び順はstate.toggle_button_orderが正であり、
         # ここはIDから実体を引くためだけに使う（今後ボタンが増えてもここに1行
@@ -399,6 +462,7 @@ class PetWindow(QWidget):
         layout.addWidget(self.status_panel)
         layout.addWidget(self.anim_speed_panel)
         layout.addWidget(self.label)
+        layout.addWidget(self.narration_bar)
         # 末尾にstretchを入れないと、ウィンドウ高さを直接setGeometryで変更した際に
         # QVBoxLayoutが余白の配分先を一意に決められず、maximumHeight=0で畳んでいる
         # status_panel側にy座標のズレとして現れることがあった（高さ自体は0のまま）。
@@ -482,6 +546,24 @@ class PetWindow(QWidget):
         button_size = self._button_size()
 
         self.label.setFixedSize(pet_size, pet_size)
+        attention_icon_font_px = max(14, int(28 * self._scale))
+        self.attention_event_icon.setStyleSheet(
+            f"background: transparent; font-size: {attention_icon_font_px}px;"
+        )
+        self.attention_event_icon.adjustSize()
+        self.attention_event_icon.move(self.label.x(), self.label.y() - attention_icon_font_px // 2)
+
+        level_font_px = max(9, int(12 * self._scale))
+        self.level_label.setStyleSheet(
+            "background-color: rgba(0, 0, 0, 170); color: white;"
+            f" border: 1px solid rgba(255, 255, 255, 60); border-radius: 6px; font-size: {level_font_px}px;"
+            " padding: 1px 5px;"
+        )
+        self.level_label.setText(f"Lv.{self.state.level}")
+        self.level_label.adjustSize()
+        self.level_label.move(
+            self.label.x() + 4, self.label.y() + self.label.height() - self.level_label.height() - 4
+        )
         if self._current_image_path is not None:
             # 元画像から再スケールする（表示中のpixmapを再拡大すると多重縮小で劣化するため）
             pixmap = QPixmap(str(self._current_image_path))
@@ -536,7 +618,7 @@ class PetWindow(QWidget):
 
         gauge_height = max(4, int(8 * self._scale))
         label_font_px = max(7, int(10 * self._scale))
-        label_width = max(16, int(28 * self._scale))
+        label_width = max(20, int(38 * self._scale))  # 「なでAP」まで収まる幅に拡張
         # status_panel自体の幅をpet_sizeに明示的に固定する。これが無いと、
         # 中のQProgressBar/QLabelをsetFixedWidthで縮めても、status_panelの
         # sizeHintキャッシュが縮小方向に追従せず、ウィンドウ全体の幅が
@@ -545,12 +627,13 @@ class PetWindow(QWidget):
         row_spacing = 4  # 各rowのsetSpacing(4)と合わせる
         self.status_panel.setFixedWidth(pet_size)
         gauge_width = max(20, pet_size - label_width - row_spacing - panel_h_margin * 2)
-        for bar in (self.hunger_bar, self.mood_bar, self.stamina_bar):
+        for bar in (self.hunger_bar, self.mood_bar, self.stamina_bar, self.pet_ap_bar):
             bar.setFixedWidth(gauge_width)
             bar.setFixedHeight(gauge_height)
         for text_label in self._status_text_labels:
             text_label.setStyleSheet(f"color: white; font-size: {label_font_px}px;")
             text_label.setFixedWidth(label_width)
+        self.affection_label.setStyleSheet(f"color: white; font-size: {label_font_px}px;")
         # button_barと同様、折りたたみの「開いた時の高さ」をスケールに応じて更新する。
         # 閉じている時はmaximumHeight=0を維持する（折りたたみ状態を壊さない）。
         self._status_panel_open_height = self.status_panel.sizeHint().height()
@@ -567,6 +650,19 @@ class PetWindow(QWidget):
         self._chat_panel_open_height = self.chat_panel.sizeHint().height()
         if self._chat_open:
             self.chat_panel.setMaximumHeight(self._chat_panel_open_height)
+
+        # narration_barもpet_sizeに幅を揃える（常時表示のため折りたたみ高さ管理は不要）。
+        narration_font_px = max(8, int(11 * self._scale))
+        narration_bar_height = max(14, int(NARRATION_BAR_HEIGHT * self._scale))
+        self.narration_bar.setFixedWidth(pet_size)
+        self.narration_bar.setFixedHeight(narration_bar_height)
+        self.narration_viewport.setFixedHeight(narration_bar_height)
+        self.narration_label.setStyleSheet(
+            f"color: rgba(230, 230, 230, 230); font-size: {narration_font_px}px;"
+        )
+        self.narration_label.adjustSize()  # フォントサイズ変更後の幅でスクロール判定が狂わないよう再計算
+        narration_button_size = max(12, int((NARRATION_BAR_HEIGHT - 6) * self._scale))
+        self.narration_log_button.setFixedSize(narration_button_size, narration_button_size)
 
         # レイアウト管理下の子ウィジェットのサイズ変更をウィンドウ全体に反映させる。
         # adjustSize()単体だと、一度大きくなったウィンドウが縮小方向にはうまく
@@ -591,6 +687,10 @@ class PetWindow(QWidget):
             self.button_bar.setGeometry(self._button_bar_open_rect())
         # ウィンドウサイズが確定した後、グリップ・トグルボタン類を追従させる
         self._reposition_overlay_widgets()
+        if self._chat_open:
+            # chat_panel内のレイアウトが確定した後でないとpet_name_inputのy座標が
+            # 正しく取れないため、ここ（layout().activate()の後）で再配置する。
+            self._reposition_chat_close_button()
 
     # --- ステータスゲージの構築 ---
     def _build_status_bars(self) -> None:
@@ -611,12 +711,14 @@ class PetWindow(QWidget):
         self.hunger_bar = self._make_status_bar()
         self.mood_bar = self._make_status_bar()
         self.stamina_bar = self._make_status_bar()
+        self.pet_ap_bar = self._make_status_bar()
         self._status_text_labels: list[QLabel] = []  # _apply_scaleでフォント/幅を再適用するため保持
 
         for label_text, bar in (
             ("満腹", self.hunger_bar),
             ("機嫌", self.mood_bar),
             ("体力", self.stamina_bar),
+            ("なでAP", self.pet_ap_bar),
         ):
             row = QHBoxLayout()
             row.setSpacing(4)
@@ -627,6 +729,12 @@ class PetWindow(QWidget):
             row.addWidget(text_label)
             row.addWidget(bar)
             panel_layout.addLayout(row)
+
+        # なつき度・レベルは0〜100ゲージではなく「次のレベルまでの累積値」のため、
+        # 他のゲージとは別にテキストで表示する。
+        self.affection_label = QLabel(self.status_panel)
+        self.affection_label.setStyleSheet("color: white; font-size: 10px;")
+        panel_layout.addWidget(self.affection_label)
 
     def _make_status_bar(self) -> QProgressBar:
         bar = QProgressBar(self.status_panel)
@@ -642,12 +750,25 @@ class PetWindow(QWidget):
             (self.hunger_bar, self.state.hunger),
             (self.mood_bar, self.state.mood),
             (self.stamina_bar, self.state.stamina),
+            (self.pet_ap_bar, self.state.pet_ap),
         ):
             bar.setValue(int(value))
             bar.setStyleSheet(
                 "QProgressBar { background-color: rgba(255,255,255,60); border-radius: 4px; }"
                 f"QProgressBar::chunk {{ background-color: {self._gauge_color(value)}; border-radius: 4px; }}"
             )
+        self.affection_label.setText(
+            f"なつき度 あと{self.state.affection_to_next_level():.0f}"
+            f" 連続ケア{self.state.affection_care_streak_count}回/{self.state.affection_care_streak_days}日"
+        )
+        self.attention_event_icon.setVisible(self.state.is_attention_event_active())
+        self.level_label.setText(f"Lv.{self.state.level}")
+        self.level_label.adjustSize()
+        self.level_label.move(
+            self.label.x() + 4, self.label.y() + self.label.height() - self.level_label.height() - 4
+        )
+        self._update_bedtime_button_visibility()
+        self.refresh_narration()
 
     @staticmethod
     def _gauge_color(value: float) -> str:
@@ -723,8 +844,7 @@ class PetWindow(QWidget):
         self.feed_button.clicked.connect(self._on_feed_clicked)
 
         self.pet_button = QPushButton("👋", self.button_bar)
-        self.pet_button.setToolTip("なでる")
-        self.pet_button.clicked.connect(self._on_pet_clicked)
+        self.pet_button.clicked.connect(self._toggle_pet_mode)
 
         self.time_button = QPushButton("⏰", self.button_bar)
         self.time_button.setToolTip("時間操作")
@@ -739,6 +859,7 @@ class PetWindow(QWidget):
             button.setFixedSize(BUTTON_SIZE, BUTTON_SIZE)
             button.setStyleSheet(button_style)
             bar_layout.addWidget(button)
+        self._update_pet_mode_button_style()  # pet_buttonは上記一括styleの直後に状態別styleで上書きする
 
     def _build_quit_toggle_button(self) -> None:
         """常時表示する終了ボタン（❌）。縦積みスタックの一員として並び替え対象になる。
@@ -907,6 +1028,35 @@ class PetWindow(QWidget):
             _set_window_z_order(hwnd, _HWND_BOTTOM)
             self._keep_bottom_timer.start()
 
+    def _update_pet_mode_button_style(self) -> None:
+        """なでるモードの現在状態に応じてbutton_bar内の👋ボタンの見た目を切り替える。"""
+        if self._pet_mode_on:
+            self.pet_button.setToolTip("なでるモード中（キャラ上をドラッグでこすれます。クリックで解除）")
+            self.pet_button.setStyleSheet(
+                "QPushButton {"
+                " background-color: rgba(220, 110, 160, 220);"
+                " border: none; border-radius: 6px; font-size: 16px;"
+                "}"
+                "QPushButton:hover { background-color: rgba(235, 130, 175, 240); }"
+            )
+        else:
+            self.pet_button.setToolTip("なでるモードOFF（クリックで有効化）")
+            self.pet_button.setStyleSheet(
+                "QPushButton {"
+                " background-color: rgba(255, 255, 255, 160);"
+                " border: none; border-radius: 6px; font-size: 16px;"
+                "}"
+                "QPushButton:hover { background-color: rgba(255, 255, 255, 220); }"
+                "QPushButton:disabled { background-color: rgba(255, 255, 255, 60); }"
+            )
+
+    def _toggle_pet_mode(self) -> None:
+        """なでるモードのON/OFFを切り替える。OFFへの切り替え時は進行中のこすり状態も片付ける。"""
+        self._pet_mode_on = not self._pet_mode_on
+        if not self._pet_mode_on:
+            self._cancel_stroke()
+        self._update_pet_mode_button_style()
+
         self._raise_resize_grips()
         for toggle_button in self._all_toggle_buttons:
             toggle_button.raise_()
@@ -933,6 +1083,82 @@ class PetWindow(QWidget):
             "QPushButton:hover { background-color: rgba(90, 90, 90, 220); }"
         )
         self.chat_toggle_button.clicked.connect(self._toggle_chat_panel)
+
+    def _build_bedtime_toggle_button(self) -> None:
+        """お休み時間設定ボタン（🌙）。レベル10で解放され、押下で時刻選択ダイアログを開く。
+
+        レベル10未満の間は非表示にする（詳細はsleep_feature_spec.md参照）。
+        """
+        self.bedtime_toggle_button = _DraggableToggleButton("bedtime", self, self)
+        self.bedtime_toggle_button.setText("🌙")
+        self.bedtime_toggle_button.setToolTip("お休み時間の設定（ドラッグで並び替え可能）")
+        self.bedtime_toggle_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
+        self.bedtime_toggle_button.setStyleSheet(
+            "QPushButton {"
+            " background-color: rgba(60, 60, 60, 200);"
+            " border: 1.5px solid rgba(255, 255, 255, 220);"
+            " border-radius: 6px; font-size: 14px; color: white;"
+            "}"
+            "QPushButton:hover { background-color: rgba(90, 90, 90, 220); }"
+        )
+        self.bedtime_toggle_button.clicked.connect(self._open_bedtime_dialog)
+
+    def _build_debug_sleep_toggle_button(self) -> None:
+        """デバッグ用: 押下で即座に入眠させるボタン（😴）。動作確認後に削除予定。"""
+        self.debug_sleep_toggle_button = _DraggableToggleButton("debug_sleep", self, self)
+        self.debug_sleep_toggle_button.setText("😴")
+        self.debug_sleep_toggle_button.setToolTip("【デバッグ】即座に入眠させる")
+        self.debug_sleep_toggle_button.setFixedSize(MENU_TOGGLE_SIZE, MENU_TOGGLE_SIZE)
+        self.debug_sleep_toggle_button.setStyleSheet(
+            "QPushButton {"
+            " background-color: rgba(200, 80, 80, 200);"
+            " border: 1.5px solid rgba(255, 255, 255, 220);"
+            " border-radius: 6px; font-size: 14px; color: white;"
+            "}"
+            "QPushButton:hover { background-color: rgba(220, 100, 100, 220); }"
+        )
+        self.debug_sleep_toggle_button.clicked.connect(self._on_debug_sleep_clicked)
+
+    def _on_debug_sleep_clicked(self) -> None:
+        self.controller.debug_start_sleep()
+
+    def _open_bedtime_dialog(self) -> None:
+        """お休み時間（時:分）を設定するダイアログを開く。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("お休み時間の設定")
+        dialog_layout = QVBoxLayout(dialog)
+
+        time_edit = QTimeEdit(dialog)
+        time_edit.setDisplayFormat("HH:mm")
+        if self.state.bedtime_hour is not None and self.state.bedtime_minute is not None:
+            time_edit.setTime(QTime(self.state.bedtime_hour, self.state.bedtime_minute))
+        else:
+            time_edit.setTime(QTime(22, 0))
+        dialog_layout.addWidget(time_edit)
+
+        button_row = QHBoxLayout()
+        clear_button = QPushButton("設定解除", dialog)
+        save_button = QPushButton("保存", dialog)
+        button_row.addWidget(clear_button)
+        button_row.addWidget(save_button)
+        dialog_layout.addLayout(button_row)
+
+        def on_save() -> None:
+            t = time_edit.time()
+            self.controller.set_bedtime(t.hour(), t.minute())
+            dialog.accept()
+
+        def on_clear() -> None:
+            self.controller.set_bedtime(None, None)
+            dialog.accept()
+
+        save_button.clicked.connect(on_save)
+        clear_button.clicked.connect(on_clear)
+        dialog.exec()
+
+    def _update_bedtime_button_visibility(self) -> None:
+        """お休み時間設定ボタンはレベル10未満の間は非表示にする。"""
+        self.bedtime_toggle_button.setVisible(self.state.level >= SLEEP_BEDTIME_MIN_LEVEL)
 
     def _build_chat_panel(self) -> None:
         """話しかける入力欄パネル（テキスト入力＋送信ボタン＋スクロール可能な結果表示）。
@@ -1037,6 +1263,194 @@ class PetWindow(QWidget):
         self.chat_close_button.clicked.connect(self._toggle_chat_panel)
         self.chat_close_button.hide()
 
+    # --- 操作ナレーション（常時表示・一行） ---
+    def _build_narration_bar(self) -> None:
+        """ペット画像の下に常駐する一行ナレーション欄（タイプライター表示＋ログ一覧ボタン）。
+
+        メニュー(button_bar)等と見分けやすいよう、黒背景＋枠付きのパネルにする
+        （透過ウィンドウ上でも視認できるよう半透明、ただし完全な透過ではない）。
+        """
+        self.narration_bar = QWidget(self)
+        self.narration_bar.setObjectName("narration_bar")
+        self.narration_bar.setFixedHeight(NARRATION_BAR_HEIGHT)
+        # セレクタをobjectName指定にし、子ウィジェット(narration_viewport等)に
+        # borderスタイルが継承されて二重枠に見えてしまうのを防ぐ。
+        self.narration_bar.setStyleSheet(
+            "QWidget#narration_bar {"
+            " background-color: rgba(0, 0, 0, 170);"
+            " border: 1px solid rgba(255, 255, 255, 60); border-radius: 6px;"
+            "}"
+        )
+        bar_layout = QHBoxLayout(self.narration_bar)
+        bar_layout.setContentsMargins(6, 2, 2, 2)
+        bar_layout.setSpacing(4)
+
+        # narration_viewport: テキストがバー幅を超えたとき、はみ出した部分を
+        # 隠す「窓」。Qtの子ウィジェットは親の矩形外に描画されないため、
+        # 固定幅のこのウィジェットの中でnarration_labelをmove()すれば
+        # 自然にクリップされたスクロール（テロップ）が実現できる。
+        self.narration_viewport = QWidget(self.narration_bar)
+        self.narration_viewport.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.narration_label = QLabel("", self.narration_viewport)
+        self.narration_label.setStyleSheet("color: rgba(230, 230, 230, 230); font-size: 11px;")
+        self.narration_label.setWordWrap(False)
+
+        self.narration_log_button = QPushButton("📜", self.narration_bar)
+        self.narration_log_button.setFixedSize(NARRATION_BAR_HEIGHT - 6, NARRATION_BAR_HEIGHT - 6)
+        self.narration_log_button.setStyleSheet(
+            "QPushButton {"
+            " background: transparent; border: none; font-size: 12px;"
+            "}"
+            "QPushButton:hover { background-color: rgba(255, 255, 255, 40); border-radius: 4px; }"
+        )
+        self.narration_log_button.setToolTip("ナレーション履歴を見る")
+        self.narration_log_button.clicked.connect(self._open_narration_log_dialog)
+
+        bar_layout.addWidget(self.narration_viewport)
+        bar_layout.addWidget(self.narration_log_button)
+
+        self._narration_scroll_timer = QTimer(self)
+        self._narration_scroll_timer.timeout.connect(self._advance_narration_scroll)
+
+        self._narration_typewriter_timer = QTimer(self)
+        self._narration_typewriter_timer.timeout.connect(self._advance_narration_typewriter)
+        self._narration_hold_timer = QTimer(self)
+        self._narration_hold_timer.setSingleShot(True)
+        self._narration_hold_timer.timeout.connect(self._clear_narration_display)
+
+    def refresh_narration(self) -> None:
+        """state.narration_logに新規追加分があれば、表示キューに積んで順番に表示する。
+
+        on_changeコールバック経由でステータス変化のたびに呼ばれるため、
+        新規分が無ければ何もしない。1回の操作で複数件追加されることが
+        あるため（例: 「機嫌が回復した」＋「なつき度が上がった」）、今回まとめて
+        追加された分はキューとして順番に表示する。前回の操作由来の表示・
+        キューが残っていても、新しい操作のメッセージを優先して即座に切り替える。
+
+        新規分の判定にはnarration_log.seq（単調増加の通し番号）を使う。件数
+        （len）で比較すると、ログが上限件数に達して以降は常に件数が一定になり
+        「新規に追加された」ことを検知できなくなるため、件数ではなくseqで
+        「最後に処理したエントリより新しいものがあるか」を判定する。
+
+        睡眠中は通常のキュー処理を止め、固定の「睡眠中のようだ」文言を
+        表示し続ける（他のナレーションに上書きされない）。
+        """
+        if self.state.is_sleeping:
+            if not self._narration_sleeping_display_active:
+                self._narration_sleeping_display_active = True
+                self._narration_queue = []
+                self._start_narration_typewriter(SLEEP_NARRATION_TEXT, hold_forever=True)
+            # 睡眠中に積まれた新規ナレーション（入眠メッセージ等）はseqだけ進めて読み飛ばす
+            if self.state.narration_log:
+                self._narration_last_seq = self.state.narration_log[-1].seq
+            return
+        if self._narration_sleeping_display_active:
+            # 起床した直後: 固定表示をやめ、通常のキュー処理に戻す
+            self._narration_sleeping_display_active = False
+            self._clear_narration_display()
+
+        new_entries = [entry for entry in self.state.narration_log if entry.seq > self._narration_last_seq]
+        if not new_entries:
+            return
+        self._narration_last_seq = new_entries[-1].seq
+        texts = [entry.text for entry in new_entries]
+        # レベル変化（アップ/ダウン）は特に気づきやすくしたいメッセージのため、
+        # 同時に積まれた他のメッセージより先に表示されるよう先頭へ並べ替える。
+        texts.sort(key=lambda text: 0 if "レベルが" in text else 1)
+        self._narration_queue = texts
+        self._show_next_narration()
+
+    def _show_next_narration(self) -> None:
+        """表示キューの先頭を取り出してタイプライター表示する。キューが空なら何もしない。"""
+        if not self._narration_queue:
+            return
+        text = self._narration_queue.pop(0)
+        self._start_narration_typewriter(text)
+
+    def _start_narration_typewriter(self, text: str, hold_forever: bool = False) -> None:
+        """hold_forever=Trueの場合、全文表示後に自動で消えず／スクロールもせず表示され続ける
+        （睡眠中の固定メッセージ表示用）。"""
+        self._narration_hold_timer.stop()
+        self._narration_typewriter_timer.stop()
+        self._narration_scroll_timer.stop()
+        self._narration_typewriter_text = text
+        self._narration_typewriter_index = 0
+        self._narration_hold_forever = hold_forever
+        self.narration_label.setText("")
+        self.narration_label.adjustSize()
+        self.narration_label.move(0, 0)
+        self._narration_typewriter_timer.start(NARRATION_TYPEWRITER_INTERVAL_MS)
+
+    def _advance_narration_typewriter(self) -> None:
+        self._narration_typewriter_index += 1
+        self.narration_label.setText(
+            self._narration_typewriter_text[: self._narration_typewriter_index]
+        )
+        self.narration_label.adjustSize()
+        if self._narration_typewriter_index >= len(self._narration_typewriter_text):
+            self._narration_typewriter_timer.stop()
+            if self._narration_hold_forever:
+                return
+            # バー幅に収まる短文はそのまま保持表示、はみ出す長文は左へ流す
+            if self.narration_label.width() > self.narration_viewport.width():
+                self._narration_scroll_x = 0
+                self._narration_scroll_timer.start(NARRATION_SCROLL_INTERVAL_MS)
+            else:
+                self._narration_hold_timer.start(NARRATION_DISPLAY_HOLD_MS)
+
+    def _advance_narration_scroll(self) -> None:
+        """全文表示後、はみ出した長文を左へ1周だけ流す（最後まで流れたら止めて保持表示に移る）。"""
+        self._narration_scroll_x += NARRATION_SCROLL_STEP_PX
+        label_width = self.narration_label.width()
+        scroll_end = label_width + NARRATION_SCROLL_GAP_PX
+        if self._narration_scroll_x >= scroll_end:
+            self._narration_scroll_timer.stop()
+            self._narration_hold_timer.start(NARRATION_DISPLAY_HOLD_MS)
+            return
+        self.narration_label.move(-self._narration_scroll_x, 0)
+
+    def _clear_narration_display(self) -> None:
+        self.narration_label.setText("")
+        self._show_next_narration()
+
+    def _open_narration_log_dialog(self) -> None:
+        """過去最大NARRATION_LOG_MAX_LEN件のナレーション履歴をポップアップ表示する。"""
+        if self._narration_log_dialog is not None:
+            self._narration_log_dialog.raise_()
+            self._narration_log_dialog.activateWindow()
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("ログ")
+        dialog.resize(320, 400)
+        dialog_layout = QVBoxLayout(dialog)
+
+        log_label = QLabel(dialog)
+        log_label.setWordWrap(True)
+        log_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        # 新しいものが上に来るよう逆順で表示する
+        if self.state.narration_log:
+            lines = [
+                f"[{_format_narration_timestamp(entry.timestamp)}] {entry.text}"
+                for entry in reversed(self.state.narration_log)
+            ]
+            log_label.setText("\n".join(lines))
+        else:
+            log_label.setText("まだ記録がありません")
+
+        scroll = QScrollArea(dialog)
+        scroll.setWidget(log_label)
+        scroll.setWidgetResizable(True)
+        dialog_layout.addWidget(scroll)
+
+        def on_finished(_result: int) -> None:
+            self._narration_log_dialog = None
+
+        dialog.finished.connect(on_finished)
+        self._narration_log_dialog = dialog
+        dialog.show()
+
     def _toggle_chat_panel(self) -> None:
         """会話パネルの開閉状態をアニメーション付きで切り替える（_toggle_status_panelと同じ仕組み）。
 
@@ -1093,8 +1507,15 @@ class PetWindow(QWidget):
             self.chat_close_button.hide()
 
     def _on_chat_animation_finished(self) -> None:
-        """会話パネル開閉アニメーション終了時、グリップ再配置と閉じるボタン位置更新を行う。"""
+        """会話パネル開閉アニメーション終了時、グリップ再配置と閉じるボタン位置更新を行う。
+
+        chat_panelの開閉もstatus_panelと同じくウィンドウ自体のgeometry（y座標・高さ）を
+        動かすため、button_barが開いたままだと追従せずlabel位置とズレてしまう。
+        button_barが開いている場合はここで位置を再確定する。
+        """
         self._chat_animation_group = None
+        if self._menu_open and self._menu_animation_group is None:
+            self.button_bar.setGeometry(self._button_bar_open_rect())
         self._reposition_overlay_widgets()
         if self._chat_open:
             self._reposition_chat_close_button()
@@ -1120,10 +1541,14 @@ class PetWindow(QWidget):
             grip.raise_()
 
     def _button_bar_open_rect(self) -> QRect:
-        """button_barが開いた状態で占める、ウィンドウ座標系での矩形（ペット画像の直下）。"""
+        """button_barが開いた状態で占める、ウィンドウ座標系での矩形（常時表示のnarration_barの直下）。
+
+        narration_barは常時表示のためメニューと場所が被ってはならず、
+        label直下ではなくnarration_barの下端を基準に展開位置を決める。
+        """
         pet_size = self._pet_size()
         return QRect(
-            self.label.x(), self.label.y() + self.label.height() + 4,
+            self.label.x(), self.narration_bar.y() + self.narration_bar.height() + 4,
             pet_size, self._button_bar_open_height,
         )
 
@@ -1280,8 +1705,15 @@ class PetWindow(QWidget):
         group.start()
 
     def _on_status_animation_finished(self) -> None:
-        """status_panel開閉アニメーション終了時、サイズ制約の後始末とグリップ再配置を行う。"""
+        """status_panel開閉アニメーション終了時、サイズ制約の後始末とグリップ再配置を行う。
+
+        status_panelの開閉はウィンドウ自体のgeometry（y座標・高さ）を動かすため、
+        button_barが開いたままだと（絶対配置かつ独立したgeometryのため）追従せず
+        label位置とズレてしまう。button_barが開いている場合はここで位置を再確定する。
+        """
         self._status_animation_group = None
+        if self._menu_open and self._menu_animation_group is None:
+            self.button_bar.setGeometry(self._button_bar_open_rect())
         self._reposition_overlay_widgets()
 
     # --- ボタンのクリックハンドラ（実処理はcontrollerに委譲） ---
@@ -1290,11 +1722,6 @@ class PetWindow(QWidget):
             # モーション再生中の連打は無視（ボタン無効化と二重の安全策）
             return
         self._start_feed_motion()
-
-    def _on_pet_clicked(self) -> None:
-        if self._petting_in_progress:
-            return
-        self._start_pet_motion()
 
     def _on_time_clicked(self) -> None:
         # ボタンの直下にサブメニューをポップアップ表示する
@@ -1422,7 +1849,16 @@ class PetWindow(QWidget):
             return
         self._current_expression = expression
 
-        if expression in EXPRESSION_ANIM_FRAMES:
+        if expression == "sleeping":
+            # 睡眠中はアニメーション停止（静止画）。sleeping用アセットが未用意の間は
+            # normalの最初のフレームにフォールバックする（アセットが届き次第、
+            # SLEEPING_ANIM_DIRに画像を置けば自動的にそちらが使われる）。
+            if not self._motion_controls_animation:
+                self._normal_anim_timer.stop()
+            sleeping_image = SLEEPING_ANIM_DIR / SLEEPING_ANIM_FRAMES[0]
+            fallback_image = NORMAL_ANIM_DIR / NORMAL_ANIM_FRAMES[0]
+            self._set_pixmap_from_path(sleeping_image if sleeping_image.exists() else fallback_image)
+        elif expression in EXPRESSION_ANIM_FRAMES:
             anim_dir, anim_frames = EXPRESSION_ANIM_FRAMES[expression]
             self._normal_frame_index = 0
             self._normal_frame_direction = 1
@@ -1584,10 +2020,10 @@ class PetWindow(QWidget):
         self._set_buttons_enabled(False)
         self._pause_normal_animation()  # カス散布中はフレーム固定表示にする
 
-        # 既に満腹の場合は食べかすモーションを出さず、確定処理と演出のみ即座に行う
+        # 睡眠中・既に満腹の場合は食べかすモーションを出さず、確定処理と演出のみ即座に行う
         # （controller.feed()を呼ぶ前にstateを直接見て判定する）
-        if self.state.hunger >= 100:
-            self.controller.feed()  # hunger>=100での呼び出しのためoverfed=True確定
+        if self.state.is_sleeping or self.state.hunger >= 100:
+            self.controller.feed()
             self._play_overfed_motion(on_complete=self._end_feed_motion)
             return
 
@@ -1641,8 +2077,8 @@ class PetWindow(QWidget):
         ボタン再有効化・進行中フラグ解除は後続演出（ハート/シェイク）が
         完全に終わるタイミングまで持ち越す（on_completで渡す）。
         """
-        overfed = self.controller.feed()
-        if overfed:
+        result = self.controller.feed()
+        if result in ("overfed", "woke_up"):
             self._play_overfed_motion(on_complete=self._end_feed_motion)
         else:
             self._play_full_heart(on_complete=self._end_feed_motion)
@@ -1757,47 +2193,24 @@ class PetWindow(QWidget):
 
         ステータス反映（機嫌上昇）は演出が短いこともあり、餌やりのように
         「終了まで確定を待つ」厳密さは求めず、開始と同時にcontroller.pet()を
-        確定させる（実装の単純さを優先）。
+        確定させる（実装の単純さを優先）。なでAPが尽きている「なですぎ」の
+        場合は機嫌回復が起きないため、あげすぎ時と同じ「困る」演出
+        （💢アイコン＋シェイク）で分かりやすく示す。
         """
         self._petting_in_progress = True
         self._set_buttons_enabled(False)
-        self._pause_normal_animation()  # バウンド＋キラキラ中はフレーム固定表示にする
-        self.controller.pet()
+        self._pause_normal_animation()  # 演出中はフレーム固定表示にする
+        result = self.controller.pet()
 
-        # 画像をY軸方向に軽くバウンドさせる。
-        # labelはQVBoxLayout管理下のため、posを直接動かすとレイアウト再計算と
-        # 競合するおそれがある（あげすぎシェイクと同じ理由）。
-        # そのためcontentsMarginsの上下を切り替えて見た目上の上下バウンドを表現する。
-        offsets = [int(v * self._scale) for v in (-10, -16, -8, -2, 0)]  # 振幅をスケールに比例させる
-        step_ms = max(1, PET_BOUNCE_DURATION_MS // len(offsets))
+        if result in ("overpetted", "woke_up"):
+            self._play_overfed_motion(on_complete=self._end_pet_motion)
+            return
 
-        def bounce_step(index: int = 0) -> None:
-            if index >= len(offsets):
-                self.label.setContentsMargins(0, 0, 0, 0)
-                # ボタン再有効化・フラグ解除はハート消滅時まで持ち越す
-                # バウンド終了後にハート演出（表示開始で180msへ加速、消滅で通常速度に復帰）
-                self._play_full_heart(on_complete=self._end_pet_motion)
-                return
-            dy = offsets[index]
-            top = max(0, -dy)
-            bottom = max(0, dy)
-            self.label.setContentsMargins(0, top, 0, bottom)
-            QTimer.singleShot(step_ms, lambda: bounce_step(index + 1))
-
-        bounce_step()
-
-        # キラキラパーティクル（画像中央を起点に周囲へ浮かび上がらせる）
-        pet_size = self._pet_size()
-        center_x = self.label.x() + pet_size // 2
-        center_y = self.label.y() + pet_size // 2
-        sparkle_area = max(60, int(120 * self._scale))
-        sparkle_widget = ParticleEffectWidget(
-            self, make_sparkle_config(self._scale), on_finished=lambda: None
-        )
-        sparkle_widget.setGeometry(
-            QRect(center_x - sparkle_area // 2, center_y - sparkle_area // 2, sparkle_area, sparkle_area)
-        )
-        sparkle_widget.show()
+        # ボタン再有効化・フラグ解除はハート消滅時まで持ち越す
+        # 表示開始で180msへ加速、消滅で通常速度に復帰
+        self._play_full_heart(on_complete=self._end_pet_motion)
+        # キラキラはなでるモードでのこすり中に手元へ追従表示されるため、
+        # ここ（機嫌回復モーション側）では重複して出さない。
 
     # --- リサイズ処理（_ResizeGripから呼ばれる） ---
     def begin_resize(self, global_pos: QPoint, corner: str) -> None:
@@ -1988,23 +2401,108 @@ class PetWindow(QWidget):
         super().showEvent(event)
         self._reposition_overlay_widgets()
 
-    # --- マウス操作: クリックでなでる / ドラッグで移動 ---
+    # --- マウス操作: なでるモード中はキャラ上でこする / それ以外はドラッグで移動 ---
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton:
+        if event.button() != Qt.LeftButton:
+            return
+        if self._pet_mode_on and self.label.geometry().contains(event.position().toPoint()):
+            self._begin_stroke(event.globalPosition().toPoint())
+        else:
             self._drag_offset = event.globalPosition().toPoint() - self.pos()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+        if self._stroking and event.buttons() & Qt.LeftButton:
+            self._update_stroke(event.globalPosition().toPoint())
+        elif self._drag_offset is not None and event.buttons() & Qt.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_offset)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton:
-            # ドラッグ移動が無かった（ほぼ同じ位置でのリリース）場合のみ「なでる」反応にする
-            moved = self._drag_offset is not None and (
-                event.globalPosition().toPoint() - (self.pos() + self._drag_offset)
-            ).manhattanLength() > 3
-            self._drag_offset = None
-            if not moved and not self._petting_in_progress:
+        if event.button() != Qt.LeftButton:
+            return
+        if self._stroking:
+            self._cancel_stroke()
+            return
+        self._drag_offset = None
+        # 位置が変わった場合は保存用に反映
+        self.state.window_position = [self.pos().x(), self.pos().y()]
+
+    # --- なでるモード: こすり操作 ---
+    def _begin_stroke(self, global_pos: QPoint) -> None:
+        self._stroking = True
+        self._stroke_last_pos = global_pos
+        self._stroke_accum_distance = 0.0
+        self._show_stroke_hand(global_pos)
+        self._stroke_sparkle_timer = QTimer(self)
+        self._stroke_sparkle_timer.setInterval(PET_STROKE_SPARKLE_INTERVAL_MS)
+        self._stroke_sparkle_timer.timeout.connect(self._spawn_stroke_sparkle)
+        self._stroke_sparkle_timer.start()
+        self._spawn_stroke_sparkle()
+
+    def _update_stroke(self, global_pos: QPoint) -> None:
+        if self._stroke_last_pos is not None:
+            delta = global_pos - self._stroke_last_pos
+            self._stroke_accum_distance += (abs(delta.x()) ** 2 + abs(delta.y()) ** 2) ** 0.5
+        self._stroke_last_pos = global_pos
+        self._move_stroke_hand(global_pos)
+        if self._stroke_accum_distance >= PET_STROKE_THRESHOLD_PX:
+            self._stroke_accum_distance = 0.0
+            if not self._petting_in_progress:
                 self._start_pet_motion()
-            # 位置が変わった場合は保存用に反映
-            self.state.window_position = [self.pos().x(), self.pos().y()]
+
+    def _cancel_stroke(self) -> None:
+        """こすり操作を終了する（モードOFF切り替え時・マウスリリース時の両方から呼ぶ）。"""
+        self._stroking = False
+        self._stroke_last_pos = None
+        self._stroke_accum_distance = 0.0
+        if self._stroke_sparkle_timer is not None:
+            self._stroke_sparkle_timer.stop()
+            self._stroke_sparkle_timer = None
+        self._hide_stroke_hand()
+
+    def _show_stroke_hand(self, global_pos: QPoint) -> None:
+        if self._stroke_hand_label is None:
+            self._stroke_hand_label = QLabel(self)
+            self._stroke_hand_label.setStyleSheet("background: transparent;")
+            font = self._stroke_hand_label.font()
+            font.setPointSize(int(20 * self._scale))
+            self._stroke_hand_label.setFont(font)
+            self._stroke_hand_label.setText("🤚")
+            self._stroke_hand_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._move_stroke_hand(global_pos)
+        self._stroke_hand_label.show()
+        self._stroke_hand_label.raise_()
+
+    def _move_stroke_hand(self, global_pos: QPoint) -> None:
+        if self._stroke_hand_label is None:
+            return
+        local_pos = self.mapFromGlobal(global_pos)
+        size = self._stroke_hand_label.sizeHint()
+        self._stroke_hand_label.move(
+            local_pos.x() - size.width() // 2, local_pos.y() - size.height() // 2
+        )
+
+    def _hide_stroke_hand(self) -> None:
+        if self._stroke_hand_label is not None:
+            self._stroke_hand_label.hide()
+
+    def _spawn_stroke_sparkle(self) -> None:
+        """こすっている間、キラキラパーティクルを現在のカーソル位置付近に継続生成する。"""
+        if self._stroke_last_pos is None:
+            return
+        local_pos = self.mapFromGlobal(self._stroke_last_pos)
+        sparkle_area = max(40, int(70 * self._scale))
+        sparkle_widget = ParticleEffectWidget(
+            self, make_sparkle_config(self._scale), on_finished=lambda: None
+        )
+        sparkle_widget.setGeometry(
+            QRect(
+                local_pos.x() - sparkle_area // 2,
+                local_pos.y() - sparkle_area // 2,
+                sparkle_area,
+                sparkle_area,
+            )
+        )
+        sparkle_widget.show()
+        sparkle_widget.raise_()
+        if self._stroke_hand_label is not None:
+            self._stroke_hand_label.raise_()

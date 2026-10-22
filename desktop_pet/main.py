@@ -17,6 +17,7 @@ from desktop_pet.pet_window import PetWindow
 from desktop_pet.tray import PetTray
 
 STATUS_CHECK_INTERVAL_MS = 60 * 1000  # 1分ごとに時間経過を反映
+IDLE_NARRATION_INTERVAL_MS = 5 * 60 * 1000  # 5分ごとにアイドル実況（実時間基準）
 
 
 def main() -> None:
@@ -54,11 +55,16 @@ def main() -> None:
 
     def refresh() -> None:
         state.apply_time_decay()
+        state.maybe_trigger_attention_event()
         window.refresh_appearance()
 
     timer = QTimer()
     timer.timeout.connect(refresh)
     timer.start(STATUS_CHECK_INTERVAL_MS)
+
+    idle_narration_timer = QTimer()
+    idle_narration_timer.timeout.connect(controller.request_idle_narration)
+    idle_narration_timer.start(IDLE_NARRATION_INTERVAL_MS)
 
     app.aboutToQuit.connect(lambda: state.save())
 

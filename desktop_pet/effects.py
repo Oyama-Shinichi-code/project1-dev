@@ -13,7 +13,7 @@ import random
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import QPointF, Qt, QTimer
-from PySide6.QtGui import QColor, QPainter, QPolygonF
+from PySide6.QtGui import QColor, QPainter, QPolygonF, QRadialGradient
 from PySide6.QtWidgets import QWidget
 
 # 食べかすらしい茶色系の色のバリエーション
@@ -23,11 +23,18 @@ CRUMB_COLORS = [
     QColor(120, 75, 35),
 ]
 
-# キラキラらしい黄色系の色のバリエーション
+# キラキラらしい黄色系の色のバリエーション（旧仕様。現在は未使用だが念のため残置）
 SPARKLE_COLORS = [
     QColor(255, 215, 0),
     QColor(255, 235, 120),
     QColor(255, 193, 7),
+]
+
+# 光の粒らしい白〜淡い水色系の色のバリエーション
+GLOW_COLORS = [
+    QColor(255, 255, 255),
+    QColor(235, 245, 255),
+    QColor(210, 235, 255),
 ]
 
 
@@ -112,7 +119,12 @@ class ParticleEffectWidget(QWidget):
             px = center_x + particle.x
             py = center_y + particle.y
             size = particle.size
-            if self._config.shape == "star":
+            if self._config.shape == "glow":
+                # 加算合成で重なり合う粒が発光しているように明るく見せる
+                painter.setCompositionMode(QPainter.CompositionMode_Plus)
+                _draw_glow(painter, px, py, size, color)
+                painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            elif self._config.shape == "star":
                 painter.drawPolygon(_star_polygon(px, py, size))
             elif particle.is_triangle:
                 triangle = QPolygonF(
@@ -126,6 +138,22 @@ class ParticleEffectWidget(QWidget):
             else:
                 painter.drawEllipse(int(px - size / 2), int(py - size / 2), int(size), int(size))
         painter.end()
+
+
+def _draw_glow(painter: QPainter, cx: float, cy: float, size: float, color: QColor) -> None:
+    """中心が明るく外側へじんわり滲む円形の光を描く（放射グラデーション）。"""
+    radius = size * 2.2  # グラデーションの滲み分、粒のサイズより大きく広げる
+    gradient = QRadialGradient(cx, cy, radius)
+    center_color = QColor(color)
+    gradient.setColorAt(0.0, center_color)
+    mid_color = QColor(color)
+    mid_color.setAlphaF(center_color.alphaF() * 0.4)
+    gradient.setColorAt(0.4, mid_color)
+    edge_color = QColor(color)
+    edge_color.setAlphaF(0.0)
+    gradient.setColorAt(1.0, edge_color)
+    painter.setBrush(gradient)
+    painter.drawEllipse(QPointF(cx, cy), radius, radius)
 
 
 def _star_polygon(cx: float, cy: float, size: float) -> QPolygonF:
@@ -156,17 +184,17 @@ def make_crumb_config(scale: float = 1.0) -> ParticleEffectConfig:
 
 
 def make_sparkle_config(scale: float = 1.0) -> ParticleEffectConfig:
-    """なでるモーション用: キラキラが軽やかに浮かび上がって消える設定。
+    """なでるモーション用: 白い光の粒が軽やかに浮かび上がって消える設定。
 
     scale: ウィンドウの拡大縮小に合わせて粒のサイズ・速度を比例させる係数。
     """
     return ParticleEffectConfig(
-        colors=SPARKLE_COLORS,
-        count_range=(4, 6),
-        lifetime_ms=700,
+        colors=GLOW_COLORS,
+        count_range=(6, 10),
+        lifetime_ms=600,
         interval_ms=30,
-        speed_range=(0.4 * scale, 1.0 * scale),
-        size_range=(3 * scale, 5 * scale),
+        speed_range=(0.3 * scale, 0.9 * scale),
+        size_range=(1 * scale, 2.2 * scale),  # 小粒にして光の粒子感を出す
         gravity=-0.03 * scale,  # 負の重力でふわっと上に浮かぶ動きにする
-        shape="star",
+        shape="glow",
     )

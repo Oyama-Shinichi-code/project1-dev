@@ -10,7 +10,7 @@ from typing import Callable
 
 from PySide6.QtWidgets import QApplication
 
-from desktop_pet.ai_chat import EvaluationResult, EvaluationWorker
+from desktop_pet.ai_chat import EvaluationResult, EvaluationWorker, IdleNarrationWorker
 from desktop_pet.mood_rules import compute_mood_delta
 from desktop_pet.pet_state import ChatHistoryEntry, PetState
 
@@ -43,34 +43,59 @@ class PetController:
         self._get_api_key = get_api_key
         # 進行中のEvaluationWorkerへの参照（GC防止のため必須）。多重送信の防止にも使う。
         self._active_chat_worker: EvaluationWorker | None = None
+        # 進行中のIdleNarrationWorkerへの参照（GC防止・多重送信防止）。
+        self._active_idle_narration_worker: IdleNarrationWorker | None = None
 
-    def feed(self) -> bool:
-        """餌やりの実処理。戻り値は「あげすぎ」だったかどうか（True=あげすぎ）。
+    def feed(self) -> str:
+        """餌やりの実処理。戻り値は "normal" | "overfed" | "woke_up"。
 
-        モーション再生の分岐（通常はハート演出、あげすぎはシェイク演出）に
-        呼び出し側（PetWindow）が使う。ステータス反映自体はここで確定させる。
+        睡眠中にこの操作が行われた場合は、餌やり自体の効果は発生させず
+        強制起床のみ行う（"woke_up"）。モーション再生の分岐（通常はハート演出、
+        あげすぎ/強制起床は困るモーション）に呼び出し側（PetWindow）が使う。
         """
+        if self.state.wake_up_by_action():
+            self._on_change()
+            return "woke_up"
         overfed = self.state.hunger >= 100
         if overfed:
-            # あげすぎ時は満腹度を加算しない代わりに、機嫌を少し下げるペナルティを与える
+            # あげすぎ時は満腹度を加算しない代わりに、機嫌・なつき度を下げるペナルティを与える
             # （「無理に食べさせられて嫌がる」ことの表現。hunger自体は変化させない）。
             # apply_time_decay()はここでは呼ばない。満腹度の減少は時間経過（定期タイマー側の
             # apply_time_decay呼び出し）のみに委ね、アクション起点では発生させないため。
-            self.state.mood = max(0.0, self.state.mood - 5.0)
+            self.state.overfeed_penalty()
         else:
             self.state.feed()
         self._on_change()
-        return overfed
+        return "overfed" if overfed else "normal"
 
-    def pet(self) -> None:
-        self.state.pet()
+    def pet(self) -> str:
+        """なでるの実処理。戻り値は "normal" | "overpetted" | "woke_up"。
+
+        睡眠中にこの操作が行われた場合は、なでる自体の効果は発生させず
+        強制起床のみ行う（"woke_up"）。
+        """
+        if self.state.wake_up_by_action():
+            self._on_change()
+            return "woke_up"
+        overpetted = self.state.pet()
         self._on_change()
+        return "overpetted" if overpetted else "normal"
 
     def change_time(self, minutes: float) -> None:
         if minutes >= 0:
             self.state.advance_time(minutes)
         else:
             self.state.rewind_time(-minutes)
+        self._on_change()
+
+    def debug_start_sleep(self) -> None:
+        """デバッグ用: 条件を無視して即座に入眠させる。"""
+        self.state.start_sleep_debug()
+        self._on_change()
+
+    def set_bedtime(self, hour: int | None, minute: int | None) -> None:
+        """お休み時間を設定する（Noneで未設定に戻す）。"""
+        self.state.set_bedtime(hour, minute)
         self._on_change()
 
     def quit(self, window_pos: tuple[int, int]) -> None:
@@ -146,3 +171,37 @@ class PetController:
 
     def _clear_active_chat_worker(self) -> None:
         self._active_chat_worker = None
+
+    def request_idle_narration(self) -> bool:
+        """何も操作していない間の定期実況（アイドル実況）をGemini APIに要求する。
+
+        戻り値はワーカーを起動できたかどうか。APIキー未設定、または既に
+        前回のリクエストが進行中の場合はFalse（呼び出し元は静かにスキップしてよい）。
+        結果はstate.push_narration()経由でnarration_logに追記され、on_changeで
+        UIへ通知される。失敗時はログに積まず何もしない（アイドル実況は失敗しても
+        実害がないため、チャット機能のようにエラー文言をユーザーに出す必要はない）。
+        """
+        if self._active_idle_narration_worker is not None:
+            return False
+        api_key = self._get_api_key()
+        if not api_key:
+            return False
+
+        status_summary = (
+            f"満腹度:{self.state.hunger:.0f} 機嫌:{self.state.mood:.0f} "
+            f"体力:{self.state.stamina:.0f} なでAP:{self.state.pet_ap:.0f} "
+            f"レベル:{self.state.level}"
+        )
+        worker = IdleNarrationWorker(api_key, status_summary)
+        worker.narration_succeeded.connect(self._on_idle_narration_succeeded)
+        worker.finished.connect(self._clear_active_idle_narration_worker)
+        self._active_idle_narration_worker = worker
+        worker.start()
+        return True
+
+    def _on_idle_narration_succeeded(self, narration: str) -> None:
+        self.state.push_narration(narration)
+        self._on_change()
+
+    def _clear_active_idle_narration_worker(self) -> None:
+        self._active_idle_narration_worker = None
